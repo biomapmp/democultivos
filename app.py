@@ -131,9 +131,9 @@ def inicializar_gee():
         
         # Fallback: autenticación local (desarrollo en tu Linux)
         try:
-            ee.Initialize(project='biomap-gee-app')
+            ee.Initialize(project='democultivos')
             st.session_state.gee_authenticated = True
-            st.session_state.gee_project = 'biomap-gee-app'
+            st.session_state.gee_project = 'democultivos'
             print("✅ GEE inicializado localmente (modo desarrollo)")
             return True
         except Exception as e:
