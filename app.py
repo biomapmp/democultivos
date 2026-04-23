@@ -121,9 +121,9 @@ def inicializar_gee():
                     key_data=json.dumps(credentials_info)
                 )
                 # El proyecto se toma del secreto o se puede dejar por defecto
-                ee.Initialize(credentials, project=credentials_info.get('project_id', 'biomap-gee-app'))
+                ee.Initialize(credentials, project=credentials_info.get('project_id', 'democultivos'))
                 st.session_state.gee_authenticated = True
-                st.session_state.gee_project = credentials_info.get('project_id', 'biomap-gee-app')
+                st.session_state.gee_project = credentials_info.get('project_id', 'democultivos')
                 print("✅ GEE inicializado con Service Account (biomap.mp@gmail.com)")
                 return True
             except Exception as e:
