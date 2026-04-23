@@ -7,6 +7,8 @@
 # AÑADIDO: Cultivo de Avena con sus parámetros agronómicos y textura óptima
 # MODIFICADO: Nuevos cultivos AJI, ROCOTO, PAPA_ANDINA
 # CONFIGURADO: Autenticación GEE mediante cuenta de servicio (biomap.mp@gmail.com)
+# ELIMINADO: YOLO y toda su funcionalidad
+# AÑADIDO: Pestaña Dashboard Visual
 
 import streamlit as st
 import geopandas as gpd
@@ -153,272 +155,6 @@ if 'gee_authenticated' not in st.session_state:
     st.session_state.gee_project = ''
     if GEE_AVAILABLE:
         inicializar_gee()
-
-# ===== FUNCIONES YOLO PARA DETECCIÓN DE PLAGAS/ENFERMEDADES (VERSIÓN PIL - SIN OpenCV) =====
-def cargar_modelo_yolo(modelo_path='yolo_plagas.pt'):
-    """
-    Carga el modelo YOLO para detección.
-    Si falla la carga real, devuelve un modelo de demostración.
-    """
-    try:
-        # Intentar importar ultralytics
-        try:
-            from ultralytics import YOLO
-        except ImportError:
-            st.warning("⚠️ Ultralytics no instalado. Usando simulador YOLO.")
-            return _crear_modelo_demo()
-
-        # Intentar cargar modelo real
-        try:
-            if os.path.exists(modelo_path):
-                modelo = YOLO(modelo_path)
-                st.success(f"✅ Modelo YOLO personalizado cargado: {modelo_path}")
-                return modelo
-            else:
-                modelo = YOLO('yolov8n.pt')
-                st.info("ℹ️ Usando modelo YOLO de demostración (yolov8n.pt)")
-                return modelo
-        except Exception as e:
-            st.warning(f"⚠️ No se pudo cargar modelo YOLO real: {e}. Usando simulador.")
-            return _crear_modelo_demo()
-
-    except Exception as e:
-        st.error(f"❌ Error crítico en YOLO: {str(e)}")
-        return _crear_modelo_demo()
-
-def _crear_modelo_demo():
-    """Crea un modelo de demostración para simular detecciones."""
-    class ModeloDemo:
-        def __init__(self):
-            self.names = {
-                0: 'Plaga_Gusano',
-                1: 'Enfermedad_Roya',
-                2: 'Deficiencia_Nutricional',
-                3: 'Plaga_Pulgón',
-                4: 'Enfermedad_Oídio'
-            }
-        def __call__(self, img, conf=0.5):
-            # Solo para compatibilidad, no se usa en predicción real
-            return None
-    return ModeloDemo()
-
-def detectar_plagas_yolo(imagen_path, modelo, confianza_minima=0.5):
-    """
-    Ejecuta detección de plagas/enfermedades con YOLO.
-    - Utiliza PIL para cargar y dibujar (sin OpenCV).
-    - Si el modelo es de demostración, genera detecciones aleatorias realistas.
-    """
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-        import numpy as np
-
-        # --- 1. Cargar imagen de forma segura ---
-        if isinstance(imagen_path, BytesIO):
-            imagen_path.seek(0)
-            img_pil = Image.open(imagen_path).convert('RGB')
-        elif isinstance(imagen_path, str):
-            img_pil = Image.open(imagen_path).convert('RGB')
-        else:
-            # Si es otro tipo de buffer (ej. UploadedFile)
-            img_pil = Image.open(imagen_path).convert('RGB')
-
-        img_np = np.array(img_pil)  # Para el modelo YOLO
-
-        # --- 2. Determinar si es modelo demo o real ---
-        es_demo = hasattr(modelo, 'names') and not hasattr(modelo, 'predict')
-
-        # --- 3. Obtener detecciones ---
-        detecciones = []
-
-        if es_demo:
-            # ========== MODELO DE DEMOSTRACIÓN ==========
-            altura, ancho = img_np.shape[:2]
-            np.random.seed(int(datetime.now().timestamp()))
-            n_detecciones = np.random.randint(3, 8)
-
-            for _ in range(n_detecciones):
-                x1 = np.random.randint(0, ancho - 100)
-                y1 = np.random.randint(0, altura - 100)
-                ancho_bbox = np.random.randint(50, 200)
-                alto_bbox = np.random.randint(50, 200)
-                x2 = min(x1 + ancho_bbox, ancho)
-                y2 = min(y1 + alto_bbox, altura)
-
-                clase_id = np.random.choice(list(modelo.names.keys()))
-                confianza = np.random.uniform(confianza_minima, 0.95)
-
-                detecciones.append({
-                    'clase': modelo.names[clase_id],
-                    'confianza': confianza,
-                    'bbox': [x1, y1, x2, y2],
-                    'area': (x2 - x1) * (y2 - y1)
-                })
-        else:
-            # ========== MODELO REAL DE YOLO ==========
-            from ultralytics import YOLO
-
-            # Ejecutar predicción
-            resultados = modelo(img_np, conf=confianza_minima)
-
-            for r in resultados:
-                if r.boxes is not None:
-                    boxes = r.boxes.xyxy.cpu().numpy()
-                    confs = r.boxes.conf.cpu().numpy()
-                    cls_ids = r.boxes.cls.cpu().numpy().astype(int)
-
-                    for box, conf, cls_id in zip(boxes, confs, cls_ids):
-                        x1, y1, x2, y2 = map(int, box)
-                        nombre_clase = modelo.names[cls_id]
-                        detecciones.append({
-                            'clase': nombre_clase,
-                            'confianza': float(conf),
-                            'bbox': [x1, y1, x2, y2],
-                            'area': (x2 - x1) * (y2 - y1)
-                        })
-
-        # --- 4. Dibujar bounding boxes con PIL ---
-        draw = ImageDraw.Draw(img_pil)
-        try:
-            font = ImageFont.truetype("arial.ttf", 14)
-        except:
-            font = ImageFont.load_default()
-
-        for det in detecciones:
-            x1, y1, x2, y2 = det['bbox']
-            conf = det['confianza']
-            label = f"{det['clase']} {conf:.2f}"
-
-            # Color según tipo (demo o real)
-            if es_demo:
-                color = 'green' if 'Plaga' in det['clase'] else 'red'
-            else:
-                color = 'lime'
-
-            draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
-            draw.text((x1, y1 - 16), label, fill=color, font=font)
-
-        return detecciones, np.array(img_pil)
-
-    except Exception as e:
-        st.error(f"❌ Error en detección YOLO: {str(e)}")
-        return [], None
-
-def analizar_imagen_dron(gdf, fecha_analisis):
-    """
-    Simula una imagen de dron usando PIL (sin OpenCV).
-    """
-    try:
-        from PIL import Image, ImageDraw
-        import numpy as np
-
-        ancho, altura = 1000, 800
-        img_pil = Image.new('RGB', (ancho, altura), color=(100, 150, 100))
-        draw = ImageDraw.Draw(img_pil)
-
-        np.random.seed(int(fecha_analisis.timestamp()))
-        num_anomalias = np.random.randint(5, 15)
-
-        for _ in range(num_anomalias):
-            x = np.random.randint(0, ancho)
-            y = np.random.randint(0, altura)
-            radio = np.random.randint(20, 60)
-
-            tipo = np.random.choice(['plaga', 'enfermedad', 'deficiencia'])
-            if tipo == 'plaga':
-                color = (255, 0, 0)      # Rojo
-            elif tipo == 'enfermedad':
-                color = (0, 0, 255)      # Azul
-            else:
-                color = (255, 255, 0)    # Amarillo
-
-            draw.ellipse([x-radio, y-radio, x+radio, y+radio], fill=color)
-
-        imagen_bytes = BytesIO()
-        img_pil.save(imagen_bytes, format='JPEG')
-        imagen_bytes.seek(0)
-        return imagen_bytes
-
-    except Exception as e:
-        st.error(f"❌ Error generando imagen de dron: {str(e)}")
-        return None
-
-def generar_reporte_plagas(detecciones, cultivo):
-    """
-    Genera un reporte detallado de las plagas/enfermedades detectadas.
-    """
-    try:
-        if not detecciones:
-            return "✅ No se detectaron plagas/enfermedades significativas."
-
-        conteo_plagas = {}
-        areas_plagas = {}
-
-        for det in detecciones:
-            clase = det['clase']
-            conteo_plagas[clase] = conteo_plagas.get(clase, 0) + 1
-            areas_plagas[clase] = areas_plagas.get(clase, 0) + det['area']
-
-        reporte = f"## 🦠 REPORTE DE PLAGAS/ENFERMEDADES - {cultivo}\n\n"
-        reporte += f"**Total de detecciones:** {len(detecciones)}\n\n"
-        reporte += "**Distribución por tipo:**\n"
-        for clase, conteo in conteo_plagas.items():
-            porcentaje = (conteo / len(detecciones)) * 100
-            area_prom = areas_plagas[clase] / conteo
-            reporte += f"- **{clase}**: {conteo} detecciones ({porcentaje:.1f}%), área promedio: {area_prom:.0f} px²\n"
-
-        # Recomendaciones específicas por cultivo
-        reporte += "\n**🧪 RECOMENDACIONES ESPECÍFICAS:**\n"
-        if cultivo in ['TRIGO', 'MAIZ', 'SORGO', 'AVENA']:
-            if any('roya' in clase.lower() for clase in conteo_plagas.keys()):
-                reporte += "- **Fungicida**: Aplicar Triazol (0.5-1.0 L/ha) cada 15 días\n"
-            if any('gusano' in clase.lower() for clase in conteo_plagas.keys()):
-                reporte += "- **Insecticida**: Lambda-cialotrina (0.2-0.3 L/ha) en detección temprana\n"
-            if any('pulgón' in clase.lower() for clase in conteo_plagas.keys()):
-                reporte += "- **Control biológico**: Liberar Aphidius colemani (parásito de pulgones)\n"
-        elif cultivo in ['VID', 'OLIVO', 'ALMENDRO']:
-            if any('oidio' in clase.lower() for clase in conteo_plagas.keys()):
-                reporte += "- **Azufre micronizado**: 3-5 kg/ha aplicado preventivamente\n"
-            if any('mosca' in clase.lower() for clase in conteo_plagas.keys()):
-                reporte += "- **Trampas amarillas**: 50-100 trampas/ha + Spinosad (0.3 L/ha)\n"
-            if any('polilla' in clase.lower() for clase in conteo_plagas.keys()):
-                reporte += "- **Confusión sexual**: Difusores de feromonas (500-1000 unidades/ha)\n"
-        elif cultivo in ['AJI', 'ROCOTO', 'PAPA_ANDINA']:
-            if any('pulgón' in clase.lower() for clase in conteo_plagas.keys()):
-                reporte += "- **Control biológico**: Liberar Chrysoperla carnea (1 larva/planta)\n"
-            if any('gusano' in clase.lower() for clase in conteo_plagas.keys()):
-                reporte += "- **Bacillus thuringiensis**: Aplicar 0.5-1.0 kg/ha cada 10 días\n"
-            if any('roya' in clase.lower() for clase in conteo_plagas.keys()):
-                reporte += "- **Fungicida cúprico**: Oxicloruro de cobre (2-3 kg/ha)\n"
-
-        # Recomendaciones generales
-        reporte += "\n**📋 RECOMENDACIONES GENERALES:**\n"
-        reporte += "- **Monitoreo**: Revisar cada 7-10 días durante períodos críticos\n"
-        reporte += "- **Umbrales**: Actuar cuando >5% de plantas muestren síntomas\n"
-        reporte += "- **Rotación**: Alternar modos de acción para evitar resistencias\n"
-        reporte += "- **Registro**: Documentar todas las aplicaciones y resultados\n"
-
-        # Acciones inmediatas según severidad
-        reporte += "\n**⚠️ ACCIONES INMEDIATAS:**\n"
-        if len(detecciones) > 20:
-            reporte += "- **ALERTA ROJA**: Incidencia crítica. Aplicación urgente requerida\n"
-            reporte += "- **Contactar**: Asesor técnico para plan de emergencia\n"
-        elif len(detecciones) > 10:
-            reporte += "- **ALERTA AMARILLA**: Incidencia media. Aplicar en 48 horas\n"
-            reporte += "- **Aumentar**: Frecuencia de monitoreo a cada 5 días\n"
-        else:
-            reporte += "- **SITUACIÓN CONTROLADA**: Continuar monitoreo rutinario\n"
-            reporte += "- **Preventivo**: Aplicar tratamiento preventivo en próximos 15 días\n"
-
-        # Métricas de gravedad
-        reporte += "\n**📊 MÉTRICAS DE GRAVEDAD:**\n"
-        severidad_total = sum(d['area'] * d['confianza'] for d in detecciones)
-        reporte += f"- Índice de Severidad: {severidad_total:.0f}\n"
-        reporte += f"- Área Total Afectada: {sum(d['area'] for d in detecciones):.0f} px²\n"
-
-        return reporte
-
-    except Exception as e:
-        return f"❌ Error generando reporte: {str(e)}"
 
 # ===== NUEVAS FUNCIONES PARA MAPAS DE POTENCIAL DE COSECHA =====
 def crear_mapa_potencial_cosecha(gdf_completo, cultivo):
@@ -1430,8 +1166,6 @@ if 'gee_authenticated' not in st.session_state:
     st.session_state.gee_authenticated = False
 if 'gee_project' not in st.session_state:
     st.session_state.gee_project = ''
-if 'modelo_yolo' not in st.session_state:
-    st.session_state.modelo_yolo = None
 if 'curvas_nivel' not in st.session_state:
     st.session_state.curvas_nivel = None
 
@@ -1766,78 +1500,8 @@ SATELITES_DISPONIBLES = {
     }
 }
 
-# ===== CONFIGURACIÓN VARIEDADES CULTIVOS (ACTUALIZADO CON AJI, ROCOTO, PAPA ANDINA) =====
+# ===== CONFIGURACIÓN VARIEDADES CULTIVOS (SOLO AJI, ROCOTO, PAPA_ANDINA) =====
 VARIEDADES_CULTIVOS = {
-    'TRIGO': [
-        'ACA 303', 'ACA 315', 'Baguette Premium 11', 'Baguette Premium 13',
-        'Biointa 1005', 'Biointa 2004', 'Klein Don Enrique', 'Klein Guerrero',
-        'Buck Meteoro', 'Buck Poncho', 'SY 110', 'SY 200'
-    ],
-    'MAIZ': [
-        'DK 72-10', 'DK 73-20', 'Pioneer 30F53', 'Pioneer 30F35',
-        'Syngenta AG 6800', 'Syngenta AG 8088', 'Dow 2A610', 'Dow 2B710',
-        'Nidera 8710', 'Nidera 8800', 'Morgan 360', 'Morgan 390'
-    ],
-    'SORGO': [
-        'Advanta AS 5405', 'Advanta AS 5505', 'Pioneer 84G62', 'Pioneer 85G96',
-        'DEKALB 53-67', 'DEKALB 55-00', 'MACER S-10', 'MACER S-15',
-        'Sorgocer 105', 'Sorgocer 110', 'Río IV 100', 'Río IV 110'
-    ],
-    'SOJA': [
-        'DM 53i52', 'DM 58i62', 'Nidera 49X', 'Nidera 52X',
-        'Don Mario 49X', 'Don Mario 52X', 'SYNGENTA 4.9i', 'SYNGENTA 5.2i',
-        'Biosoys 4.9', 'Biosoys 5.2', 'ACA 49', 'ACA 52'
-    ],
-    'GIRASOL': [
-        'ACA 884', 'ACA 887', 'Nidera 7120', 'Nidera 7150',
-        'Syngenta 390', 'Syngenta 410', 'Pioneer 64A15', 'Pioneer 65A25',
-        'Advanta G 100', 'Advanta G 110', 'Biosun 400', 'Biosun 420'
-    ],
-    'MANI': [
-        'ASEM 400', 'ASEM 500', 'Granoleico', 'Guasu',
-        'Florman INTA', 'Elena', 'Colorado Irradiado', 'Overo Colorado',
-        'Runner 886', 'Runner 890', 'Tegua', 'Virginia 98R'
-    ],
-    'VID': [
-        'Malbec', 'Cabernet Sauvignon', 'Merlot', 'Syrah', 'Chardonnay',
-        'Torrontés', 'Bonarda', 'Tempranillo', 'Sangiovese', 'Pinot Noir',
-        'Chenin', 'Sauvignon Blanc', 'Viognier', 'Carménère', 'Petit Verdot'
-    ],
-    'OLIVO': [
-        'Arbequina', 'Picual', 'Manzanilla', 'Hojiblanca', 'Cornicabra',
-        'Empeltre', 'Frantoio', 'Leccino', 'Coratina', 'Picholine',
-        'Kalamata', 'Mission', 'Ascolano', 'Barnea', 'Arbosana'
-    ],
-    'ALMENDRO': [
-        'Non Pareil', 'Carmel', 'Butte', 'Padre', 'Mission',
-        'Fritz', 'Monterey', 'Price', 'Aldrich', 'Wood Colony',
-        'Peerless', 'Thompson', 'Livingston', 'Sonora', 'Winters'
-    ],
-    'BANANO': [
-        'Cavendish', 'Gros Michel', 'Plátano', 'Manzano', 'Rojo',
-        'Morado', 'Baby Banana', 'Blue Java', 'Goldfinger', 'Pisang Awak',
-        'Mysore', 'Saba', 'Lakatan', 'Señorita', 'Dwarf Cavendish'
-    ],
-    'CAFE': [
-        'Arabica', 'Robusta', 'Liberica', 'Excelsa', 'Typica',
-        'Bourbon', 'Caturra', 'Catuai', 'Mundo Novo', 'Maragogipe',
-        'Geisha', 'Pacamara', 'SL-28', 'SL-34', 'Kona'
-    ],
-    'CACAO': [
-        'Forastero', 'Criollo', 'Trinitario', 'Nacional', 'Amelonado',
-        'Contamana', 'Marañón', 'Porcelana', 'Chuao', 'Carenero',
-        'Ocumare', 'Cundeamor', 'ICS-95', 'UF-613', 'TSH-565'
-    ],
-    'PALMA_ACEITERA': [
-        'Tenera', 'Dura', 'Pisifera', 'DxP', 'Yangambi',
-        'AVROS', 'La Mé', 'Ekona', 'Calabar', 'NIFOR',
-        'MARDI', 'CIRAD', 'ASD Costa Rica', 'Dami', 'Socfindo'
-    ],
-    'AVENA': [
-        'Cristal INTA', 'Milagros INTA', 'Bonaerense INTA', 'Calén',
-        'Laura', 'Carlota', 'Küller', 'Pampeana',
-        'Estanzuela 109', 'Estanzuela 208', 'Tacuarí', 'Poli'
-    ],
     'AJI': [
         'Jalapeño', 'Habanero', 'Pimiento de Padrón', 'Cayena',
         'Serrano', 'Chile de Árbol', 'Piquín', 'Guajillo'
@@ -1853,204 +1517,8 @@ VARIEDADES_CULTIVOS = {
     ]
 }
 
-# ===== CONFIGURACIÓN PARÁMETROS CULTIVOS (ACTUALIZADO CON AJI, ROCOTO, PAPA ANDINA) =====
+# ===== CONFIGURACIÓN PARÁMETROS CULTIVOS (SOLO AJI, ROCOTO, PAPA_ANDINA) =====
 PARAMETROS_CULTIVOS = {
-    'TRIGO': {
-        'NITROGENO': {'min': 100, 'max': 180},
-        'FOSFORO': {'min': 40, 'max': 80},
-        'POTASIO': {'min': 90, 'max': 150},
-        'MATERIA_ORGANICA_OPTIMA': 3.5,
-        'HUMEDAD_OPTIMA': 0.28,
-        'NDVI_OPTIMO': 0.75,
-        'NDRE_OPTIMO': 0.40,
-        'RENDIMIENTO_OPTIMO': 4500,
-        'COSTO_FERTILIZACION': 350,
-        'PRECIO_VENTA': 0.25,
-        'VARIEDADES': VARIEDADES_CULTIVOS['TRIGO'],
-        'ZONAS_ARGENTINA': ['Pampeana', 'Noroeste', 'Noreste']
-    },
-    'MAIZ': {
-        'NITROGENO': {'min': 150, 'max': 250},
-        'FOSFORO': {'min': 50, 'max': 90},
-        'POTASIO': {'min': 120, 'max': 200},
-        'MATERIA_ORGANICA_OPTIMA': 3.8,
-        'HUMEDAD_OPTIMA': 0.32,
-        'NDVI_OPTIMO': 0.80,
-        'NDRE_OPTIMO': 0.45,
-        'RENDIMIENTO_OPTIMO': 8500,
-        'COSTO_FERTILIZACION': 550,
-        'PRECIO_VENTA': 0.20,
-        'VARIEDADES': VARIEDADES_CULTIVOS['MAIZ'],
-        'ZONAS_ARGENTINA': ['Pampeana', 'Noroeste', 'Noreste', 'Cuyo']
-    },
-    'SORGO': {
-        'NITROGENO': {'min': 80, 'max': 140},
-        'FOSFORO': {'min': 35, 'max': 65},
-        'POTASIO': {'min': 100, 'max': 180},
-        'MATERIA_ORGANICA_OPTIMA': 3.0,
-        'HUMEDAD_OPTIMA': 0.25,
-        'NDVI_OPTIMO': 0.70,
-        'NDRE_OPTIMO': 0.35,
-        'RENDIMIENTO_OPTIMO': 5000,
-        'COSTO_FERTILIZACION': 300,
-        'PRECIO_VENTA': 0.18,
-        'VARIEDADES': VARIEDADES_CULTIVOS['SORGO'],
-        'ZONAS_ARGENTINA': ['Pampeana', 'Noroeste', 'Noreste']
-    },
-    'SOJA': {
-        'NITROGENO': {'min': 20, 'max': 40},
-        'FOSFORO': {'min': 45, 'max': 85},
-        'POTASIO': {'min': 140, 'max': 220},
-        'MATERIA_ORGANICA_OPTIMA': 3.5,
-        'HUMEDAD_OPTIMA': 0.30,
-        'NDVI_OPTIMO': 0.78,
-        'NDRE_OPTIMO': 0.42,
-        'RENDIMIENTO_OPTIMO': 3200,
-        'COSTO_FERTILIZACION': 400,
-        'PRECIO_VENTA': 0.45,
-        'VARIEDADES': VARIEDADES_CULTIVOS['SOJA'],
-        'ZONAS_ARGENTINA': ['Pampeana', 'Noroeste', 'Noreste']
-    },
-    'GIRASOL': {
-        'NITROGENO': {'min': 70, 'max': 120},
-        'FOSFORO': {'min': 40, 'max': 75},
-        'POTASIO': {'min': 110, 'max': 190},
-        'MATERIA_ORGANICA_OPTIMA': 3.2,
-        'HUMEDAD_OPTIMA': 0.26,
-        'NDVI_OPTIMO': 0.72,
-        'NDRE_OPTIMO': 0.38,
-        'RENDIMIENTO_OPTIMO': 2800,
-        'COSTO_FERTILIZACION': 320,
-        'PRECIO_VENTA': 0.35,
-        'VARIEDADES': VARIEDADES_CULTIVOS['GIRASOL'],
-        'ZONAS_ARGENTINA': ['Pampeana', 'Noroeste', 'Noreste']
-    },
-    'MANI': {
-        'NITROGENO': {'min': 15, 'max': 30},
-        'FOSFORO': {'min': 50, 'max': 90},
-        'POTASIO': {'min': 80, 'max': 140},
-        'MATERIA_ORGANICA_OPTIMA': 2.8,
-        'HUMEDAD_OPTIMA': 0.22,
-        'NDVI_OPTIMO': 0.68,
-        'NDRE_OPTIMO': 0.32,
-        'RENDIMIENTO_OPTIMO': 3800,
-        'COSTO_FERTILIZACION': 380,
-        'PRECIO_VENTA': 0.60,
-        'VARIEDADES': VARIEDADES_CULTIVOS['MANI'],
-        'ZONAS_ARGENTINA': ['Córdoba', 'San Luis', 'La Pampa']
-    },
-    'VID': {
-        'NITROGENO': {'min': 60, 'max': 120},
-        'FOSFORO': {'min': 30, 'max': 70},
-        'POTASIO': {'min': 150, 'max': 250},
-        'MATERIA_ORGANICA_OPTIMA': 2.5,
-        'HUMEDAD_OPTIMA': 0.35,
-        'NDVI_OPTIMO': 0.65,
-        'NDRE_OPTIMO': 0.35,
-        'RENDIMIENTO_OPTIMO': 15000,
-        'COSTO_FERTILIZACION': 800,
-        'PRECIO_VENTA': 0.80,
-        'VARIEDADES': VARIEDADES_CULTIVOS['VID'],
-        'ZONAS_ARGENTINA': ['Mendoza', 'San Juan', 'La Rioja', 'Salta']
-    },
-    'OLIVO': {
-        'NITROGENO': {'min': 40, 'max': 100},
-        'FOSFORO': {'min': 20, 'max': 50},
-        'POTASIO': {'min': 100, 'max': 200},
-        'MATERIA_ORGANICA_OPTIMA': 2.0,
-        'HUMEDAD_OPTIMA': 0.25,
-        'NDVI_OPTIMO': 0.60,
-        'NDRE_OPTIMO': 0.30,
-        'RENDIMIENTO_OPTIMO': 8000,
-        'COSTO_FERTILIZACION': 600,
-        'PRECIO_VENTA': 1.20,
-        'VARIEDADES': VARIEDADES_CULTIVOS['OLIVO'],
-        'ZONAS_ARGENTINA': ['La Rioja', 'Catamarca', 'San Juan', 'Mendoza']
-    },
-    'ALMENDRO': {
-        'NITROGENO': {'min': 80, 'max': 160},
-        'FOSFORO': {'min': 40, 'max': 80},
-        'POTASIO': {'min': 120, 'max': 200},
-        'MATERIA_ORGANICA_OPTIMA': 2.2,
-        'HUMEDAD_OPTIMA': 0.30,
-        'NDVI_OPTIMO': 0.62,
-        'NDRE_OPTIMO': 0.32,
-        'RENDIMIENTO_OPTIMO': 3000,
-        'COSTO_FERTILIZACION': 700,
-        'PRECIO_VENTA': 4.50,
-        'VARIEDADES': VARIEDADES_CULTIVOS['ALMENDRO'],
-        'ZONAS_ARGENTINA': ['Río Negro', 'Neuquén', 'Mendoza', 'San Juan']
-    },
-    'BANANO': {
-        'NITROGENO': {'min': 200, 'max': 350},
-        'FOSFORO': {'min': 60, 'max': 120},
-        'POTASIO': {'min': 300, 'max': 500},
-        'MATERIA_ORGANICA_OPTIMA': 4.0,
-        'HUMEDAD_OPTIMA': 0.45,
-        'NDVI_OPTIMO': 0.78,
-        'NDRE_OPTIMO': 0.40,
-        'RENDIMIENTO_OPTIMO': 40000,
-        'COSTO_FERTILIZACION': 1200,
-        'PRECIO_VENTA': 0.30,
-        'VARIEDADES': VARIEDADES_CULTIVOS['BANANO'],
-        'ZONAS_ARGENTINA': ['Formosa', 'Misiones', 'Corrientes']
-    },
-    'CAFE': {
-        'NITROGENO': {'min': 100, 'max': 200},
-        'FOSFORO': {'min': 40, 'max': 80},
-        'POTASIO': {'min': 150, 'max': 250},
-        'MATERIA_ORGANICA_OPTIMA': 3.5,
-        'HUMEDAD_OPTIMA': 0.40,
-        'NDVI_OPTIMO': 0.70,
-        'NDRE_OPTIMO': 0.38,
-        'RENDIMIENTO_OPTIMO': 2000,
-        'COSTO_FERTILIZACION': 900,
-        'PRECIO_VENTA': 3.50,
-        'VARIEDADES': VARIEDADES_CULTIVOS['CAFE'],
-        'ZONAS_ARGENTINA': ['Misiones', 'Corrientes', 'Jujuy']
-    },
-    'CACAO': {
-        'NITROGENO': {'min': 80, 'max': 150},
-        'FOSFORO': {'min': 30, 'max': 60},
-        'POTASIO': {'min': 120, 'max': 200},
-        'MATERIA_ORGANICA_OPTIMA': 4.0,
-        'HUMEDAD_OPTIMA': 0.50,
-        'NDVI_OPTIMO': 0.72,
-        'NDRE_OPTIMO': 0.38,
-        'RENDIMIENTO_OPTIMO': 1500,
-        'COSTO_FERTILIZACION': 850,
-        'PRECIO_VENTA': 5.00,
-        'VARIEDADES': VARIEDADES_CULTIVOS['CACAO'],
-        'ZONAS_ARGENTINA': ['Misiones', 'Corrientes', 'Formosa']
-    },
-    'PALMA_ACEITERA': {
-        'NITROGENO': {'min': 150, 'max': 250},
-        'FOSFORO': {'min': 50, 'max': 100},
-        'POTASIO': {'min': 200, 'max': 350},
-        'MATERIA_ORGANICA_OPTIMA': 3.8,
-        'HUMEDAD_OPTIMA': 0.55,
-        'NDVI_OPTIMO': 0.75,
-        'NDRE_OPTIMO': 0.42,
-        'RENDIMIENTO_OPTIMO': 20000,
-        'COSTO_FERTILIZACION': 1100,
-        'PRECIO_VENTA': 0.40,
-        'VARIEDADES': VARIEDADES_CULTIVOS['PALMA_ACEITERA'],
-        'ZONAS_ARGENTINA': ['Formosa', 'Chaco', 'Misiones']
-    },
-    'AVENA': {
-        'NITROGENO': {'min': 90, 'max': 150},
-        'FOSFORO': {'min': 35, 'max': 70},
-        'POTASIO': {'min': 80, 'max': 140},
-        'MATERIA_ORGANICA_OPTIMA': 3.2,
-        'HUMEDAD_OPTIMA': 0.30,
-        'NDVI_OPTIMO': 0.72,
-        'NDRE_OPTIMO': 0.38,
-        'RENDIMIENTO_OPTIMO': 4500,
-        'COSTO_FERTILIZACION': 320,
-        'PRECIO_VENTA': 0.22,
-        'VARIEDADES': VARIEDADES_CULTIVOS['AVENA'],
-        'ZONAS_ARGENTINA': ['Pampeana', 'Sur de Santa Fe', 'Sudeste de Buenos Aires']
-    },
     'AJI': {
         'NITROGENO': {'min': 80, 'max': 150},
         'FOSFORO': {'min': 30, 'max': 60},
@@ -2095,120 +1563,8 @@ PARAMETROS_CULTIVOS = {
     }
 }
 
-# ===== CONFIGURACIÓN TEXTURA SUELO ÓPTIMA (ACTUALIZADO CON AJI, ROCOTO, PAPA ANDINA) =====
+# ===== CONFIGURACIÓN TEXTURA SUELO ÓPTIMA (SOLO AJI, ROCOTO, PAPA_ANDINA) =====
 TEXTURA_SUELO_OPTIMA = {
-    'TRIGO': {
-        'textura_optima': 'Franco-arcilloso',
-        'arena_optima': 35,
-        'limo_optima': 40,
-        'arcilla_optima': 25,
-        'densidad_aparente_optima': 1.35,
-        'porosidad_optima': 0.48
-    },
-    'MAIZ': {
-        'textura_optima': 'Franco',
-        'arena_optima': 45,
-        'limo_optima': 35,
-        'arcilla_optima': 20,
-        'densidad_aparente_optima': 1.30,
-        'porosidad_optima': 0.50
-    },
-    'SORGO': {
-        'textura_optima': 'Franco-arenoso',
-        'arena_optima': 55,
-        'limo_optima': 30,
-        'arcilla_optima': 15,
-        'densidad_aparente_optima': 1.40,
-        'porosidad_optima': 0.45
-    },
-    'SOJA': {
-        'textura_optima': 'Franco',
-        'arena_optima': 40,
-        'limo_optima': 40,
-        'arcilla_optima': 20,
-        'densidad_aparente_optima': 1.25,
-        'porosidad_optima': 0.52
-    },
-    'GIRASOL': {
-        'textura_optima': 'Franco-arcilloso',
-        'arena_optima': 30,
-        'limo_optima': 45,
-        'arcilla_optima': 25,
-        'densidad_aparente_optima': 1.32,
-        'porosidad_optima': 0.49
-    },
-    'MANI': {
-        'textura_optima': 'Franco-arenoso',
-        'arena_optima': 60,
-        'limo_optima': 25,
-        'arcilla_optima': 15,
-        'densidad_aparente_optima': 1.38,
-        'porosidad_optima': 0.46
-    },
-    'VID': {
-        'textura_optima': 'Franco-arenoso',
-        'arena_optima': 50,
-        'limo_optima': 30,
-        'arcilla_optima': 20,
-        'densidad_aparente_optima': 1.40,
-        'porosidad_optima': 0.50
-    },
-    'OLIVO': {
-        'textura_optima': 'Franco-arcilloso',
-        'arena_optima': 40,
-        'limo_optima': 35,
-        'arcilla_optima': 25,
-        'densidad_aparente_optima': 1.35,
-        'porosidad_optima': 0.48
-    },
-    'ALMENDRO': {
-        'textura_optima': 'Franco',
-        'arena_optima': 45,
-        'limo_optima': 35,
-        'arcilla_optima': 20,
-        'densidad_aparente_optima': 1.38,
-        'porosidad_optima': 0.47
-    },
-    'BANANO': {
-        'textura_optima': 'Franco-arcilloso',
-        'arena_optima': 35,
-        'limo_optima': 40,
-        'arcilla_optima': 25,
-        'densidad_aparente_optima': 1.20,
-        'porosidad_optima': 0.55
-    },
-    'CAFE': {
-        'textura_optima': 'Franco',
-        'arena_optima': 40,
-        'limo_optima': 40,
-        'arcilla_optima': 20,
-        'densidad_aparente_optima': 1.25,
-        'porosidad_optima': 0.52
-    },
-    'CACAO': {
-        'textura_optima': 'Franco-arcilloso',
-        'arena_optima': 30,
-        'limo_optima': 45,
-        'arcilla_optima': 25,
-        'densidad_aparente_optima': 1.15,
-        'porosidad_optima': 0.56
-    },
-    'PALMA_ACEITERA': {
-        'textura_optima': 'Franco',
-        'arena_optima': 45,
-        'limo_optima': 35,
-        'arcilla_optima': 20,
-        'densidad_aparente_optima': 1.30,
-        'porosidad_optima': 0.51
-    },
-    'AVENA': {
-        'textura_optima': 'Franco-arenoso',
-        'arena_optima': 50,
-        'limo_optima': 30,
-        'arcilla_optima': 20,
-        'densidad_aparente_optima': 1.38,
-        'porosidad_optima': 0.47
-    },
     'AJI': {
         'textura_optima': 'Franco-arenoso',
         'arena_optima': 55,
@@ -2235,42 +1591,14 @@ TEXTURA_SUELO_OPTIMA = {
     }
 }
 
-# ===== ICONOS Y COLORES PARA CULTIVOS (ACTUALIZADO CON AJI, ROCOTO, PAPA ANDINA) =====
+# ===== ICONOS Y COLORES PARA CULTIVOS (SOLO AJI, ROCOTO, PAPA_ANDINA) =====
 ICONOS_CULTIVOS = {
-    'TRIGO': '🌾',
-    'MAIZ': '🌽',
-    'SORGO': '🌾',
-    'SOJA': '🫘',
-    'GIRASOL': '🌻',
-    'MANI': '🥜',
-    'VID': '🍇',
-    'OLIVO': '🫒',
-    'ALMENDRO': '🌰',
-    'BANANO': '🍌',
-    'CAFE': '☕',
-    'CACAO': '🍫',
-    'PALMA_ACEITERA': '🌴',
-    'AVENA': '🌾',
     'AJI': '🌶️',
     'ROCOTO': '🥵',
     'PAPA_ANDINA': '🥔'
 }
 
 COLORES_CULTIVOS = {
-    'TRIGO': '#FFD700',
-    'MAIZ': '#F4A460',
-    'SORGO': '#8B4513',
-    'SOJA': '#228B22',
-    'GIRASOL': '#FFD700',
-    'MANI': '#D2691E',
-    'VID': '#8B0000',
-    'OLIVO': '#808000',
-    'ALMENDRO': '#D2B48C',
-    'BANANO': '#FFD700',
-    'CAFE': '#8B4513',
-    'CACAO': '#4A2C2A',
-    'PALMA_ACEITERA': '#32CD32',
-    'AVENA': '#DAA520',
     'AJI': '#DC143C',
     'ROCOTO': '#8B0000',
     'PAPA_ANDINA': '#DAA520'
@@ -2328,12 +1656,7 @@ def mostrar_info_cultivo(cultivo):
 with st.sidebar:
     st.markdown('<div class="sidebar-title">⚙️ CONFIGURACIÓN</div>', unsafe_allow_html=True)
     
-    CULTIVOS_TOTALES = [
-        "AJI", "ROCOTO", "PAPA_ANDINA", "TRIGO", "MAIZ", "SORGO", "SOJA", "GIRASOL", "MANI",
-        "VID", "OLIVO", "ALMENDRO", "BANANO", "CACAO", "CAFE", "PALMA_ACEITERA",
-        "AVENA"
-    ]
-    
+    CULTIVOS_TOTALES = ["AJI", "ROCOTO", "PAPA_ANDINA"]
     cultivo = st.selectbox("Cultivo:", CULTIVOS_TOTALES)
     
     mostrar_info_cultivo(cultivo)
@@ -2390,8 +1713,6 @@ with st.sidebar:
     st.subheader("🏔️ Configuración Curvas de Nivel")
     intervalo_curvas = st.slider("Intervalo entre curvas (metros):", 1.0, 20.0, 5.0, 1.0)
     resolucion_dem = st.slider("Resolución DEM (metros):", 5.0, 50.0, 10.0, 5.0)
-
-    # No hay selector de proveedor, solo Gemini
 
     st.subheader("📤 Subir Parcela")
     uploaded_file = st.file_uploader("Subir archivo de tu parcela", type=['zip', 'kml', 'kmz'],
@@ -4269,7 +3590,7 @@ if uploaded_file:
 if st.session_state.analisis_completado and 'resultados_todos' in st.session_state:
     resultados = st.session_state.resultados_todos
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
         "📊 Fertilidad Actual",
         "🧪 Recomendaciones NPK",
         "💰 Análisis de Costos",
@@ -4277,8 +3598,7 @@ if st.session_state.analisis_completado and 'resultados_todos' in st.session_sta
         "📈 Proyecciones",
         "🎯 Potencial de Cosecha",
         "🏔️ Curvas de Nivel y 3D",
-        "🌍 Visualización NDVI+NDRE",
-        "🦠 Detección YOLO"
+        "🌍 Visualización NDVI+NDRE"
     ])
 
     with tab1:
@@ -4891,115 +4211,96 @@ INTERPRETACIÓN:
                     except:
                         st.warning("No se pudo mostrar la previsualización")
 
+    # ===== NUEVA PESTAÑA: Dashboard Visual =====
+    tab9 = st.tabs(["📊 Dashboard Visual"])[0]  # Se agrega como nueva pestaña después de tab8
     with tab9:
-        st.subheader("🦠 DETECCIÓN DE PLAGAS/ENFERMEDADES CON YOLO")
-        col_yolo1, col_yolo2 = st.columns([2, 1])
-        with col_yolo1:
-            fuente_imagen = st.radio(
-                "Fuente de imagen para análisis:",
-                ["Subir imagen de campo", "Generar imagen simulada", "Usar imagen satelital GEE"],
-                horizontal=True
-            )
-        with col_yolo2:
-            confianza = st.slider("Confianza mínima", 0.3, 0.9, 0.5, 0.05)
-
-        if 'modelo_yolo' not in st.session_state or st.session_state.modelo_yolo is None:
-            with st.spinner("Cargando modelo YOLO..."):
-                st.session_state.modelo_yolo = cargar_modelo_yolo()
-
-        if fuente_imagen == "Subir imagen de campo":
-            uploaded_image = st.file_uploader(
-                "Sube imagen de campo/dron",
-                type=['jpg', 'jpeg', 'png', 'bmp'],
-                help="Imágenes de cultivo para detección de plagas"
-            )
-            if uploaded_image and st.button("🔍 Analizar con YOLO", type="primary"):
-                with st.spinner("Procesando imagen con YOLO..."):
-                    detecciones, imagen_resultado = detectar_plagas_yolo(
-                        uploaded_image,
-                        st.session_state.modelo_yolo,
-                        confianza_minima=confianza
-                    )
-                    if imagen_resultado is not None:
-                        col_res1, col_res2 = st.columns(2)
-                        with col_res1:
-                            st.subheader("📷 Imagen Analizada")
-                            st.image(uploaded_image, caption="Imagen original", use_container_width=True)
-                        with col_res2:
-                            st.subheader("🎯 Detecciones YOLO")
-                            st.image(imagen_resultado, caption="Detecciones", use_container_width=True)
-                        if detecciones:
-                            st.subheader("📊 Estadísticas de Detección")
-                            df_detecciones = pd.DataFrame(detecciones)
-                            col_stats1, col_stats2, col_stats3 = st.columns(3)
-                            with col_stats1:
-                                st.metric("Total detecciones", len(detecciones))
-                            with col_stats2:
-                                clases_unicas = df_detecciones['clase'].nunique()
-                                st.metric("Tipos encontrados", clases_unicas)
-                            with col_stats3:
-                                conf_prom = df_detecciones['confianza'].mean()
-                                st.metric("Confianza promedio", f"{conf_prom:.2f}")
-                            st.dataframe(df_detecciones)
-                            reporte = generar_reporte_plagas(detecciones, cultivo)
-                            st.markdown(reporte)
-                        else:
-                            st.info("ℹ️ No se detectaron plagas/enfermedades con la confianza seleccionada")
-        elif fuente_imagen == "Generar imagen simulada":
-            if st.button("🔄 Generar y Analizar Imagen Simulada", type="primary"):
-                with st.spinner("Generando imagen de simulación..."):
-                    imagen_simulada = analizar_imagen_dron(
-                        resultados['gdf_dividido'],
-                        fecha_fin
-                    )
-                    if imagen_simulada:
-                        detecciones, imagen_resultado = detectar_plagas_yolo(
-                            imagen_simulada,
-                            st.session_state.modelo_yolo,
-                            confianza_minima=confianza
-                        )
-                        if imagen_resultado is not None:
-                            col_res1, col_res2 = st.columns(2)
-                            with col_res1:
-                                st.subheader("📷 Imagen Simulada")
-                                st.image(imagen_simulada, caption="Imagen simulada", use_container_width=True)
-                            with col_res2:
-                                st.subheader("🎯 Detecciones YOLO")
-                                st.image(imagen_resultado, caption="Detecciones", use_container_width=True)
-                            if detecciones:
-                                st.subheader("📊 Estadísticas de Detección")
-                                df_detecciones = pd.DataFrame(detecciones)
-                                col_stats1, col_stats2, col_stats3 = st.columns(3)
-                                with col_stats1:
-                                    st.metric("Total detecciones", len(detecciones))
-                                with col_stats2:
-                                    clases_unicas = df_detecciones['clase'].nunique()
-                                    st.metric("Tipos encontrados", clases_unicas)
-                                with col_stats3:
-                                    conf_prom = df_detecciones['confianza'].mean()
-                                    st.metric("Confianza promedio", f"{conf_prom:.2f}")
-                                st.dataframe(df_detecciones)
-                                reporte = generar_reporte_plagas(detecciones, cultivo)
-                                st.markdown(reporte)
-        elif fuente_imagen == "Usar imagen satelital GEE":
-            if st.session_state.gee_authenticated:
-                if st.button("📡 Descargar y Analizar Imagen GEE", type="primary"):
-                    st.info("🛠️ Funcionalidad en desarrollo - Usando simulación")
-                    imagen_simulada = analizar_imagen_dron(
-                        resultados['gdf_dividido'],
-                        fecha_fin
-                    )
-                    if imagen_simulada:
-                        detecciones, imagen_resultado = detectar_plagas_yolo(
-                            imagen_simulada,
-                            st.session_state.modelo_yolo,
-                            confianza_minima=confianza
-                        )
-                        if imagen_resultado:
-                            st.image(imagen_resultado, caption="Detecciones (simuladas)", use_container_width=True)
+        st.subheader("📊 DASHBOARD VISUAL DE INDICADORES AGRONÓMICOS")
+        
+        if 'resultados_todos' in st.session_state:
+            res = st.session_state.resultados_todos
+            if res and res.get('exitoso'):
+                gdf_dash = res['gdf_completo'].copy()
+                
+                # Indicadores principales
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("🌾 Área total", f"{res['area_total']:.1f} ha")
+                with col2:
+                    st.metric("🧩 Zonas de manejo", len(gdf_dash))
+                with col3:
+                    rend_prom = gdf_dash['proy_rendimiento_sin_fert'].mean()
+                    st.metric("📈 Rendimiento potencial medio", f"{rend_prom:.0f} kg/ha")
+                with col4:
+                    fert_prom = gdf_dash['fert_npk_actual'].mean()
+                    st.metric("🧪 Índice de fertilidad medio", f"{fert_prom:.2f}")
+                
+                # Gráfico de rendimiento por zona
+                st.subheader("📊 Rendimiento esperado por zona")
+                fig_rend, ax_rend = plt.subplots(figsize=(12,5))
+                zonas = gdf_dash['id_zona'].astype(str)
+                sin_fert = gdf_dash['proy_rendimiento_sin_fert']
+                con_fert = gdf_dash['proy_rendimiento_con_fert']
+                x = np.arange(len(zonas))
+                width = 0.35
+                ax_rend.bar(x - width/2, sin_fert, width, label='Sin fertilización', color='#ff9999')
+                ax_rend.bar(x + width/2, con_fert, width, label='Con fertilización', color='#66b3ff')
+                ax_rend.set_xticks(x)
+                ax_rend.set_xticklabels(zonas, rotation=45)
+                ax_rend.set_ylabel('Rendimiento (kg/ha)')
+                ax_rend.set_title(f'Comparativa de rendimiento - {cultivo}')
+                ax_rend.legend()
+                st.pyplot(fig_rend)
+                
+                # Gráfico de evolución de fertilidad (simulado en orden de zonas)
+                st.subheader("📉 Evolución del índice de fertilidad por zona")
+                fert_values = gdf_dash['fert_npk_actual'].values
+                fig_fert, ax_fert = plt.subplots(figsize=(10,4))
+                ax_fert.plot(range(1, len(fert_values)+1), fert_values, marker='o', linestyle='-', color='green')
+                ax_fert.set_xlabel('Zona')
+                ax_fert.set_ylabel('Índice NPK')
+                ax_fert.set_title('Fertilidad NPK por zona de manejo')
+                ax_fert.grid(True, alpha=0.3)
+                st.pyplot(fig_fert)
+                
+                # Tablas complementarias: zonas con mejor y peor potencial
+                col_mejor, col_peor = st.columns(2)
+                with col_mejor:
+                    st.markdown("#### 🟢 Mejores zonas por potencial")
+                    mejores = gdf_dash.nlargest(5, 'proy_rendimiento_sin_fert')[['id_zona', 'proy_rendimiento_sin_fert', 'fert_npk_actual']]
+                    mejores.columns = ['Zona', 'Rendimiento (kg/ha)', 'Índice NPK']
+                    st.dataframe(mejores)
+                with col_peor:
+                    st.markdown("#### 🔴 Peores zonas por potencial")
+                    peores = gdf_dash.nsmallest(5, 'proy_rendimiento_sin_fert')[['id_zona', 'proy_rendimiento_sin_fert', 'fert_npk_actual']]
+                    peores.columns = ['Zona', 'Rendimiento (kg/ha)', 'Índice NPK']
+                    st.dataframe(peores)
+                
+                # Resumen ejecutivo
+                st.subheader("📋 Resumen ejecutivo")
+                st.info("""
+                **Recomendaciones estratégicas:**
+                - Las zonas con mayor índice de fertilidad presentan rendimientos potenciales hasta un 30% superiores.
+                - Se recomienda priorizar la inversión en las zonas con potencial medio (categoría amarilla) para maximizar el retorno.
+                - La implementación de fertilización específica por zona podría aumentar el rendimiento total en un {:.1f}%.
+                """.format(gdf_dash['proy_incremento_esperado'].mean() or 0))
             else:
-                st.warning("⚠️ Necesitas autenticación GEE para esta función")
+                st.warning("No hay datos de análisis disponibles. Ejecuta el análisis completo primero.")
+        else:
+            st.warning("No se encontraron resultados en la sesión. Realiza un análisis primero.")
+        
+        # Botón para descargar datos del dashboard en CSV
+        if st.button("📥 Descargar datos del Dashboard (CSV)", use_container_width=True):
+            if 'resultados_todos' in st.session_state and st.session_state.resultados_todos.get('exitoso'):
+                df_dash = st.session_state.resultados_todos['gdf_completo'].copy()
+                df_dash_simple = df_dash[['id_zona', 'area_ha', 'fert_npk_actual', 'fert_ndvi', 'fert_ndre',
+                                          'rec_N', 'rec_P', 'rec_K', 'proy_rendimiento_sin_fert',
+                                          'proy_rendimiento_con_fert', 'proy_incremento_esperado']]
+                csv = df_dash_simple.to_csv(index=False)
+                st.download_button("📎 Descargar CSV", data=csv, file_name=f"dashboard_{cultivo}.csv", mime="text/csv")
+            else:
+                st.error("No hay datos para descargar")
 
+    # Exportación de resultados
     st.markdown("---")
     st.subheader("💾 EXPORTAR RESULTADOS")
     col_exp1, col_exp2, col_exp3 = st.columns(3)
