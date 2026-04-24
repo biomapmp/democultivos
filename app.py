@@ -1,5 +1,5 @@
 # app.py - Plataforma de Gestión de Riesgos Climáticos para Ají y Rocoto
-# Versión completa con carga de parcelas funcional.
+# Incluye visualización NDVI y NDRE (con GEE o simulado)
 
 import streamlit as st
 import geopandas as gpd
@@ -20,6 +20,7 @@ import json
 from io import BytesIO
 import requests
 import contextily as ctx
+from PIL import Image
 
 # ================= CONFIGURACIÓN INICIAL =================
 warnings.filterwarnings('ignore')
@@ -40,6 +41,8 @@ except ImportError:
 
 try:
     import rasterio
+    from rasterio.transform import from_origin
+    from rasterio.crs import CRS
     RASTERIO_OK = True
 except ImportError:
     pass
@@ -129,7 +132,7 @@ UMBRALES = {
     }
 }
 
-# ================= FUNCIONES DE CARGA DE PARCELA (CORREGIDAS) =================
+# ================= FUNCIONES DE CARGA DE PARCELA =================
 def validar_crs(gdf):
     if gdf is None or len(gdf) == 0:
         return gdf
@@ -309,7 +312,121 @@ def cargar_archivo_parcela(uploaded_file):
         st.error(f"Detalle: {traceback.format_exc()}")
         return None
 
-# ================= FUNCIONES DE IA (GROQ) =================
+# ================= FUNCIONES DE VISUALIZACIÓN NDVI/NDRE =================
+def visualizar_indices_gee_estatico(gdf, satelite, fecha_inicio, fecha_fin):
+    """Retorna diccionario con imágenes NDVI y NDRE desde GEE"""
+    if not GEE_AVAILABLE or not st.session_state.gee_authenticated:
+        return None, "GEE no autenticado"
+    
+    try:
+        bounds = gdf.total_bounds
+        min_lon, min_lat, max_lon, max_lat = bounds
+        geometry = ee.Geometry.Rectangle([min_lon, min_lat, max_lon, max_lat])
+        start_date = fecha_inicio.strftime('%Y-%m-%d')
+        end_date = fecha_fin.strftime('%Y-%m-%d')
+        
+        if 'SENTINEL' in satelite.upper():
+            collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+            ndvi_bands = ['B8', 'B4']
+            ndre_bands = ['B8', 'B5']
+            title = "Sentinel-2"
+        elif 'LANDSAT' in satelite.upper():
+            collection = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+            ndvi_bands = ['SR_B5', 'SR_B4']
+            ndre_bands = ['SR_B5', 'SR_B6']
+            title = "Landsat"
+        else:
+            return None, "Satélite no soportado"
+        
+        filtered = (collection
+                   .filterBounds(geometry)
+                   .filterDate(start_date, end_date)
+                   .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 60)))
+        
+        count = filtered.size().getInfo()
+        if count == 0:
+            return None, "No hay imágenes disponibles"
+        
+        image = filtered.sort('CLOUDY_PIXEL_PERCENTAGE').first()
+        ndvi = image.normalizedDifference(ndvi_bands).rename('NDVI')
+        ndre = image.normalizedDifference(ndre_bands).rename('NDRE')
+        
+        region_params = {'dimensions': 800, 'region': geometry, 'format': 'png'}
+        ndvi_url = ndvi.getThumbURL({'min': -0.2, 'max': 0.8, 'palette': ['red', 'yellow', 'green'], **region_params})
+        ndre_url = ndre.getThumbURL({'min': -0.1, 'max': 0.6, 'palette': ['blue', 'white', 'green'], **region_params})
+        
+        import requests
+        ndvi_resp = requests.get(ndvi_url)
+        ndre_resp = requests.get(ndre_url)
+        if ndvi_resp.status_code != 200 or ndre_resp.status_code != 200:
+            return None, "Error descargando imágenes"
+        
+        ndvi_bytes = BytesIO(ndvi_resp.content)
+        ndre_bytes = BytesIO(ndre_resp.content)
+        
+        return {
+            'ndvi_bytes': ndvi_bytes,
+            'ndre_bytes': ndre_bytes,
+            'title': title,
+            'cloud_percent': image.get('CLOUDY_PIXEL_PERCENTAGE').getInfo() if image.get('CLOUDY_PIXEL_PERCENTAGE') else 0,
+        }, "Imágenes generadas correctamente"
+    except Exception as e:
+        return None, f"Error: {str(e)}"
+
+def generar_imagen_ndvi_simulada(gdf, ancho=800, alto=800):
+    """Genera una imagen simulada de NDVI (para cuando no hay GEE)"""
+    bounds = gdf.total_bounds
+    minx, miny, maxx, maxy = bounds
+    # Crear una imagen de ruido aleatorio con forma de polígono
+    x = np.linspace(minx, maxx, ancho)
+    y = np.linspace(miny, maxy, alto)
+    X, Y = np.meshgrid(x, y)
+    # Simular valores NDVI entre 0.2 y 0.8
+    ndvi = 0.3 + 0.5 * np.random.rand(alto, ancho)
+    # Aplicar máscara del polígono
+    points = np.vstack([X.ravel(), Y.ravel()]).T
+    from shapely.geometry import Point
+    mask = gdf.geometry.unary_union.contains([Point(p) for p in points])
+    mask = mask.reshape(alto, ancho)
+    ndvi[~mask] = np.nan
+    
+    fig, ax = plt.subplots(figsize=(10, 8))
+    im = ax.imshow(ndvi, extent=[minx, maxx, miny, maxy], origin='lower', cmap='RdYlGn', vmin=0, vmax=1)
+    plt.colorbar(im, ax=ax, label='NDVI')
+    gdf.boundary.plot(ax=ax, edgecolor='black', linewidth=2)
+    ax.set_title('NDVI Simulado')
+    ax.set_xlabel('Longitud')
+    ax.set_ylabel('Latitud')
+    buf = BytesIO()
+    plt.savefig(buf, format='png', dpi=100)
+    buf.seek(0)
+    plt.close()
+    return buf
+
+def exportar_mapa_tiff(imagen_bytes, gdf, nombre_base):
+    """Convierte una imagen PNG a GeoTIFF (requiere rasterio)"""
+    if not RASTERIO_OK:
+        return None, None
+    try:
+        img = Image.open(imagen_bytes)
+        gdf_proj = gdf.to_crs(epsg=3857)
+        bounds = gdf_proj.total_bounds
+        width, height = img.size
+        transform = from_origin(bounds[0], bounds[3], (bounds[2]-bounds[0])/width, (bounds[3]-bounds[1])/height)
+        img_array = np.array(img)
+        if img_array.shape[2] == 4:
+            img_array = img_array[:,:,:3]
+        img_array = np.transpose(img_array, (2,0,1))
+        tiff_buf = BytesIO()
+        with rasterio.open(tiff_buf, 'w', driver='GTiff', height=height, width=width, count=3, dtype=img_array.dtype, crs=CRS.from_epsg(3857), transform=transform, compress='lzw') as dst:
+            dst.write(img_array)
+        tiff_buf.seek(0)
+        return tiff_buf, f"{nombre_base}.tiff"
+    except Exception as e:
+        st.error(f"Error exportando a TIFF: {e}")
+        return None, None
+
+# ================= FUNCIONES DE IA =================
 def consultar_groq(prompt, max_tokens=400):
     if not GROQ_API_KEY or not GROQ_AVAILABLE:
         return "⚠️ IA no disponible: falta API Key o librería."
@@ -336,14 +453,6 @@ Genera un análisis de riesgo (bajo/medio/alto) para esta fase y una acción de 
 """
     return consultar_groq(prompt, max_tokens=200)
 
-# ================= FUNCIONES GEE SIMPLIFICADAS (DEMO) =================
-# (Para que la app funcione sin GEE, se generan datos simulados si no está autenticado)
-def obtener_ndvi_simulado():
-    return np.random.uniform(0.3, 0.8)
-
-def obtener_temperatura_simulada():
-    return np.random.uniform(15, 32)
-
 # ================= INTERFAZ PRINCIPAL =================
 st.set_page_config(page_title="Gestión de Riesgos Climáticos - Ají y Rocoto", layout="wide")
 st.title("🌶️ Plataforma de Gestión de Riesgos Climáticos para Ají y Rocoto")
@@ -358,41 +467,35 @@ with st.sidebar:
     
     st.subheader("📅 Período de análisis")
     fecha_fin = st.date_input("Fecha fin", datetime.now())
-    fecha_inicio = st.date_input("Fecha inicio", datetime.now() - timedelta(days=90))
+    fecha_inicio = st.date_input("Fecha inicio", datetime.now() - timedelta(days=30))
     
     st.subheader("🌿 Fenología")
     fase_fenologica = st.selectbox("Fase actual del cultivo", 
                                    ["siembra", "desarrollo", "floracion", "fructificacion", "cosecha"])
     
+    st.subheader("🛰️ Fuente de datos")
+    usar_gee = st.checkbox("Usar GEE (si autenticado)", value=True)
+    
     st.subheader("📡 Datos in situ (opcional)")
-    archivo_estacion = st.file_uploader("Subir CSV de estación (fecha,precipitacion,temp_max,temp_min)", type=['csv'])
+    archivo_estacion = st.file_uploader("Subir CSV de estación", type=['csv'])
 
 if not uploaded_file:
     st.info("👈 Sube un archivo de parcela para comenzar el análisis.")
     st.stop()
 
-# Cargar parcela con la función corregida
+# Cargar parcela
 with st.spinner("Cargando parcela..."):
     gdf = cargar_archivo_parcela(uploaded_file)
     if gdf is None:
         st.error("No se pudo cargar la parcela. Verifica el formato del archivo.")
         st.stop()
-    
     area_ha = calcular_superficie(gdf)
     st.success(f"✅ Parcela cargada: {area_ha:.2f} ha. CRS: {gdf.crs}")
-    
-    # Mostrar un mapa preliminar
-    fig, ax = plt.subplots(figsize=(8, 6))
-    gdf.plot(ax=ax, color='lightgreen', edgecolor='darkgreen', alpha=0.7)
-    ax.set_title("Vista de la parcela")
-    ax.set_xlabel("Longitud"); ax.set_ylabel("Latitud")
-    st.pyplot(fig)
 
 # ================= SIMULACIÓN DE DATOS SATELITALES =================
-# Si GEE está autenticado, se podrían obtener datos reales. Por ahora usamos simulados.
-ndvi_val = obtener_ndvi_simulado()
-temp_val = obtener_temperatura_simulada()
-# Para humedad simulada
+# Si GEE está autenticado y se desea usar, se pueden obtener índices reales. Por simplicidad, simulamos.
+ndvi_val = np.random.uniform(0.3, 0.8)
+temp_val = np.random.uniform(15, 32)
 humedad_val = np.random.uniform(0.2, 0.7)
 
 # ================= PESTAÑAS =================
@@ -405,10 +508,9 @@ with tab_hist:
     st.info("Visualización de índices históricos (precipitación, temperatura, NDWI) utilizando GEE.")
     if st.session_state.get("gee_authenticated", False):
         st.success("Con GEE autenticado, aquí se mostrarían mapas interactivos reales.")
-        # Aquí vendría el código para obtener y mostrar mapas de GEE
+        # Aquí se podría implementar la visualización histórica
     else:
-        st.warning("GEE no autenticado. Para ver mapas reales, configura la autenticación.")
-        # Mapas de ejemplo estáticos
+        st.warning("GEE no autenticado. Mostrando datos simulados.")
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
         axes[0].imshow(np.random.rand(100,100), cmap='Blues')
         axes[0].set_title("Precipitación (simulada)")
@@ -421,6 +523,8 @@ with tab_hist:
 
 with tab_monitoreo:
     st.header("Monitoreo de Índices por Fase Fenológica")
+    
+    # Indicadores numéricos
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("NDVI", f"{ndvi_val:.2f}")
@@ -440,6 +544,67 @@ with tab_monitoreo:
     st.write(f"**Temperatura:** {riesgo_temp}")
     st.write(f"**Humedad del suelo:** {riesgo_humedad}")
     
+    # ============= VISUALIZACIÓN DE MAPAS NDVI Y NDRE =============
+    st.subheader("🗺️ Mapas de Índices de Vegetación (NDVI y NDRE)")
+    
+    col_map1, col_map2 = st.columns(2)
+    
+    # Botón para generar mapas
+    if st.button("🔄 Generar Mapas NDVI/NDRE", use_container_width=True):
+        with st.spinner("Generando imágenes..."):
+            if usar_gee and st.session_state.get("gee_authenticated", False):
+                # Usar GEE real
+                satelite = "SENTINEL-2"  # Podría ser configurable
+                resultado, mensaje = visualizar_indices_gee_estatico(gdf, satelite, fecha_inicio, fecha_fin)
+                if resultado:
+                    st.session_state.ndvi_img = resultado['ndvi_bytes']
+                    st.session_state.ndre_img = resultado['ndre_bytes']
+                    st.session_state.img_title = resultado['title']
+                    st.success(mensaje)
+                else:
+                    st.error(mensaje)
+                    # Fallback a simulación
+                    st.session_state.ndvi_img = generar_imagen_ndvi_simulada(gdf)
+                    st.session_state.ndre_img = generar_imagen_ndvi_simulada(gdf)  # Simulada
+                    st.warning("Usando imágenes simuladas por fallo de GEE")
+            else:
+                # Datos simulados
+                st.session_state.ndvi_img = generar_imagen_ndvi_simulada(gdf)
+                st.session_state.ndre_img = generar_imagen_ndvi_simulada(gdf)
+                st.info("Usando datos simulados (GEE no autenticado o no seleccionado)")
+    
+    # Mostrar mapas si existen en sesión
+    if 'ndvi_img' in st.session_state and 'ndre_img' in st.session_state:
+        with col_map1:
+            st.image(st.session_state.ndvi_img, caption="NDVI", use_column_width=True)
+            # Botones de descarga para NDVI
+            col_d1, col_d2 = st.columns(2)
+            with col_d1:
+                st.download_button("📥 PNG", data=st.session_state.ndvi_img, file_name=f"ndvi_{cultivo}.png", mime="image/png", key="ndvi_png")
+            with col_d2:
+                if RASTERIO_OK:
+                    tiff_buf, tiff_name = exportar_mapa_tiff(st.session_state.ndvi_img, gdf, f"ndvi_{cultivo}")
+                    if tiff_buf:
+                        st.download_button("📥 GeoTIFF", data=tiff_buf, file_name=tiff_name, mime="image/tiff", key="ndvi_tiff")
+        with col_map2:
+            st.image(st.session_state.ndre_img, caption="NDRE", use_column_width=True)
+            col_d3, col_d4 = st.columns(2)
+            with col_d3:
+                st.download_button("📥 PNG", data=st.session_state.ndre_img, file_name=f"ndre_{cultivo}.png", mime="image/png", key="ndre_png")
+            with col_d4:
+                if RASTERIO_OK:
+                    tiff_buf2, tiff_name2 = exportar_mapa_tiff(st.session_state.ndre_img, gdf, f"ndre_{cultivo}")
+                    if tiff_buf2:
+                        st.download_button("📥 GeoTIFF", data=tiff_buf2, file_name=tiff_name2, mime="image/tiff", key="ndre_tiff")
+        
+        # Paquete ZIP
+        zip_buf = BytesIO()
+        with zipfile.ZipFile(zip_buf, 'w') as zf:
+            zf.writestr(f"ndvi_{cultivo}.png", st.session_state.ndvi_img.getvalue())
+            zf.writestr(f"ndre_{cultivo}.png", st.session_state.ndre_img.getvalue())
+        zip_buf.seek(0)
+        st.download_button("📦 Descargar ambos mapas (ZIP)", data=zip_buf, file_name=f"indices_{cultivo}.zip", mime="application/zip")
+    
     if archivo_estacion:
         st.subheader("📊 Datos de estación in situ")
         df_est = pd.read_csv(archivo_estacion)
@@ -454,7 +619,6 @@ with tab_alerta:
         st.session_state.alerta_texto = alerta
     
     if st.button("📄 Generar Ficha PDF", use_container_width=True):
-        # Generación simple de PDF (con reportlab si está instalado, sino TXT)
         try:
             from reportlab.lib.pagesizes import letter
             from reportlab.pdfgen import canvas
@@ -511,6 +675,9 @@ with tab_export:
         st.download_button("Descargar GeoJSON", data=geojson_str, file_name="parcela.geojson", mime="application/json")
     if 'alerta_texto' in st.session_state:
         st.download_button("Descargar alerta (TXT)", data=st.session_state.alerta_texto, file_name="alerta.txt")
+    if 'ndvi_img' in st.session_state:
+        st.download_button("Descargar NDVI (PNG)", data=st.session_state.ndvi_img, file_name=f"ndvi_{cultivo}.png", mime="image/png")
+        st.download_button("Descargar NDRE (PNG)", data=st.session_state.ndre_img, file_name=f"ndre_{cultivo}.png", mime="image/png")
 
 st.markdown("---")
-st.caption("Plataforma desarrollada con Streamlit, Google Earth Engine y Groq. Versión 2.0 - Totalmente funcional.")
+st.caption("Plataforma desarrollada con Streamlit, Google Earth Engine y Groq. Visualización NDVI/NDRE incluida.")
