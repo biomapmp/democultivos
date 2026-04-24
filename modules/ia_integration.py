@@ -1,4 +1,5 @@
 # modules/ia_integration.py - Versión para Groq con prompts agroecológicos mejorados
+# + función generar_frase_campesina para reporte visual campesino
 import os
 import time
 import pandas as pd
@@ -30,7 +31,7 @@ def llamar_groq(prompt: str, system_prompt: str = None, temperature: float = 0.3
     for intento in range(max_retries):
         try:
             response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",  # Modelo gratuito y rápido
+                model="llama-3.3-70b-versatile",
                 messages=messages,
                 temperature=temperature,
                 max_tokens=2048,
@@ -45,25 +46,17 @@ def llamar_groq(prompt: str, system_prompt: str = None, temperature: float = 0.3
                 else:
                     return None
             else:
-                # Otros errores (red, autenticación, etc.)
                 return None
     return None
 
-# Para compatibilidad con código anterior que llamaba a 'llamar_deepseek'
 llamar_deepseek = llamar_groq
 
 # ================== FUNCIONES DE PREPARACIÓN DE DATOS ==================
 def preparar_resumen_zonas(gdf_completo, cultivo: str, max_zonas: int = 3) -> Tuple[pd.DataFrame, Dict]:
-    """
-    Prepara un resumen con máximo `max_zonas` zonas representativas (baja, media, alta fertilidad).
-    Retorna un DataFrame con las zonas seleccionadas y un diccionario de estadísticas generales.
-    """
-    # Columnas esperadas en el GeoDataFrame de entrada
     cols = ['id_zona', 'area_ha', 'fert_npk_actual', 'fert_ndvi', 'fert_ndre',
             'fert_materia_organica', 'fert_humedad_suelo', 'rec_N', 'rec_P', 'rec_K',
             'costo_costo_total', 'proy_rendimiento_sin_fert', 'proy_rendimiento_con_fert',
             'proy_incremento_esperado', 'textura_suelo', 'arena', 'limo', 'arcilla']
-    # Aseguramos que existan; si no, se rellenan con NaN
     for col in cols:
         if col not in gdf_completo.columns:
             gdf_completo[col] = 0.0
@@ -73,7 +66,6 @@ def preparar_resumen_zonas(gdf_completo, cultivo: str, max_zonas: int = 3) -> Tu
                   'N_rec', 'P_rec', 'K_rec', 'Costo_total', 'Rend_sin_fert',
                   'Rend_con_fert', 'Inc_%', 'Textura', 'Arena_%', 'Limo_%', 'Arcilla_%']
 
-    # Estadísticas generales
     stats = {
         'total_area': df['Area_ha'].sum(),
         'num_zonas': len(df),
@@ -99,7 +91,6 @@ def preparar_resumen_zonas(gdf_completo, cultivo: str, max_zonas: int = 3) -> Tu
         'textura_dominante': df['Textura'].mode()[0] if not df['Textura'].empty else 'No determinada'
     }
 
-    # Seleccionar zonas representativas (baja, media, alta fertilidad NPK)
     df_sorted = df.sort_values('NPK')
     n = max_zonas
     indices = [0, len(df)//2, -1] if len(df) >= 3 else list(range(len(df)))
@@ -254,3 +245,43 @@ Incluye indicadores de monitoreo por fase y recomendaciones para manejar la resi
     if resultado is None:
         return "⚠️ Recomendaciones integradas no disponibles por error de API."
     return resultado
+
+# ===== NUEVO: Frases ultra cortas para el reporte campesino =====
+def generar_frase_campesina(cultivo, concepto, datos):
+    """
+    Devuelve una sola oración simple, en español de Perú, máximo 200 caracteres.
+    datos puede ser una Serie (valores) o un string (textura).
+    """
+    system = f"Eres un agricultor mayor experto en {cultivo}. Hablas como campesino peruano (ande o costa), sin tecnicismos. Las frases son de máximo 20 palabras."
+    
+    if concepto == "Fertilidad":
+        promedio = float(datos.mean())
+        if promedio > 0.7:
+            prompt = f"El suelo tiene fertilidad alta (más de {promedio:.1f}). ¿Qué le decimos al usuario? (una frase)"
+        elif promedio > 0.4:
+            prompt = f"Fertilidad media ({promedio:.1f}). ¿Qué consejo práctico le das?"
+        else:
+            prompt = f"Fertilidad baja ({promedio:.1f}). ¿Qué recomiendas para mejorarla rápido?"
+    elif concepto == "Rendimiento":
+        mejor = float(datos.max())
+        peor = float(datos.min())
+        prompt = f"El mejor rendimiento es {mejor:.0f} kg y el peor {peor:.0f} kg. ¿Qué zonas atender primero?"
+    elif concepto == "Textura":
+        textura = datos  # string
+        if "arenoso" in textura.lower():
+            prompt = f"La tierra es arenosa. ¿Cómo la mejoramos para {cultivo}? (una frase)"
+        elif "arcilloso" in textura.lower():
+            prompt = f"Tierra arcillosa. ¿Un consejo para que no se encharque?"
+        else:
+            prompt = f"Tierra franca (mixta). ¿Qué abono natural le pondrías?"
+    elif concepto == "Potencial":
+        alto = float(datos.max())
+        bajo = float(datos.min())
+        prompt = f"El área con más potencial da {alto:.0f} kg/ha, la que da menos produce {bajo:.0f} kg. ¿Qué hacer?"
+    else:
+        return "Observa los números y prioriza las zonas más verdes en los mapas."
+    
+    respuesta = llamar_groq(prompt, system_prompt=system, temperature=0.4)
+    if respuesta is None:
+        return "Revisa los mapas: zonas verdes = buenas, rojas = hay que mejorar el suelo."
+    return respuesta.strip()[:200]  # Máximo 200 caracteres
