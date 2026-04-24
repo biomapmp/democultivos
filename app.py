@@ -4321,7 +4321,7 @@ INTERPRETACIÓN:
             else:
                 st.error("No hay datos para descargar")
 
-    # Exportación de resultados
+      # Exportación de resultados
     st.markdown("---")
     st.subheader("💾 EXPORTAR RESULTADOS")
     col_exp1, col_exp2, col_exp3 = st.columns(3)
@@ -4394,6 +4394,22 @@ INTERPRETACIÓN:
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 key="ia_report_download"
             )
+        
+        # ---- NUEVO BOTÓN PARA REPORTE CAMPESINO ----
+        st.markdown("---")
+        if st.button("🌾 Generar PDF Campesino (solo gráficos)", key="campesino_pdf"):
+            with st.spinner("Creando reporte visual con ayuda de IA..."):
+                pdf_bytes = generar_reporte_campesino(
+                    resultados, cultivo, satelite_seleccionado, fecha_fin
+                )
+                st.download_button(
+                    label="📥 Descargar PDF Campesino",
+                    data=pdf_bytes,
+                    file_name=f"mi_chacra_{cultivo}_{datetime.now().strftime('%Y%m%d')}.pdf",
+                    mime="application/pdf"
+                )
+        # -------------------------------------------
+        
     with col_exp3:
         st.markdown("**Limpiar Resultados**")
         if st.button("🗑️ Limpiar Resultados", use_container_width=True):
@@ -4434,9 +4450,129 @@ with col_footer3:
  
     """)
 
+# ===== NUEVA FUNCIÓN: REPORTE PDF PARA CAMPESINOS (solo gráficos + IA breve) =====
+from fpdf import FPDF
+import tempfile
+
+def generar_reporte_campesino(resultados, cultivo, satelite, fecha_fin):
+    """
+    Genera un PDF con gráficos grandes, texto mínimo,
+    y frases simples generadas por IA (Groq) en español peruano.
+    """
+    gdf = resultados['gdf_completo'].copy()
+    
+    temp_dir = tempfile.mkdtemp()
+    imagenes = []
+    
+    # Gráfico 1: Fertilidad NPK
+    fig, ax = plt.subplots(figsize=(8, 4))
+    zonas = gdf['id_zona'].astype(str)
+    npk = gdf['fert_npk_actual']
+    colors = plt.cm.YlGn(npk / npk.max())
+    ax.bar(zonas, npk, color=colors)
+    ax.set_ylabel("Fertilidad (NPK)")
+    ax.set_title(f"🌱 Fertilidad del suelo - {cultivo}", fontsize=12)
+    ax.grid(True, axis='y', alpha=0.3)
+    plt.tight_layout()
+    path1 = os.path.join(temp_dir, "fert.png")
+    fig.savefig(path1, dpi=120)
+    plt.close()
+    imagenes.append(path1)
+    
+    # Gráfico 2: Rendimiento con/sin fertilización
+    fig, ax = plt.subplots(figsize=(8, 4))
+    x = np.arange(len(zonas))
+    width = 0.35
+    ax.bar(x - width/2, gdf['proy_rendimiento_sin_fert'], width, label='Sin fertilizante', color='#E6A817')
+    ax.bar(x + width/2, gdf['proy_rendimiento_con_fert'], width, label='Con fertilizante', color='#4C9A2A')
+    ax.set_xticks(x)
+    ax.set_xticklabels(zonas, rotation=45)
+    ax.set_ylabel("kg por hectárea")
+    ax.set_title(f"📈 Cosecha esperada - {cultivo}", fontsize=12)
+    ax.legend()
+    plt.tight_layout()
+    path2 = os.path.join(temp_dir, "rend.png")
+    fig.savefig(path2, dpi=120)
+    plt.close()
+    imagenes.append(path2)
+    
+    # Gráfico 3: Textura
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ancho = 0.25
+    for i, (idx, row) in enumerate(gdf.iterrows()):
+        ax.bar(i - ancho, row['arena'], width=ancho, label='Arena' if i==0 else "", color='#D98C5F')
+        ax.bar(i, row['limo'], width=ancho, label='Limo' if i==0 else "", color='#A7C5A1')
+        ax.bar(i + ancho, row['arcilla'], width=ancho, label='Arcilla' if i==0 else "", color='#6A8D73')
+    ax.set_xticks(range(len(gdf)))
+    ax.set_xticklabels(gdf['id_zona'].astype(str))
+    ax.set_ylabel("Porcentaje (%)")
+    ax.set_title("🏞️ Tipo de tierra (textura)", fontsize=12)
+    ax.legend()
+    plt.tight_layout()
+    path3 = os.path.join(temp_dir, "textura.png")
+    fig.savefig(path3, dpi=120)
+    plt.close()
+    imagenes.append(path3)
+    
+    # Gráfico 4: Potencial
+    fig, ax = plt.subplots(figsize=(8, 4))
+    sc = ax.scatter(gdf['fert_ndvi'], gdf['proy_rendimiento_sin_fert'], 
+                    c=gdf['fert_npk_actual'], cmap='YlOrRd', s=200, edgecolors='black')
+    ax.set_xlabel("Vigor del cultivo (NDVI)")
+    ax.set_ylabel("Rendimiento potencial (kg/ha)")
+    ax.set_title("⭐ Zonas con más futuro", fontsize=12)
+    cbar = plt.colorbar(sc, ax=ax)
+    cbar.set_label("Fertilidad")
+    plt.tight_layout()
+    path4 = os.path.join(temp_dir, "potencial.png")
+    fig.savefig(path4, dpi=120)
+    plt.close()
+    imagenes.append(path4)
+    
+    # Frases IA
+    from modules.ia_integration import generar_frase_campesina
+    frases = []
+    for nombre, datos in [
+        ("Fertilidad", gdf['fert_npk_actual']),
+        ("Rendimiento", gdf['proy_rendimiento_con_fert']),
+        ("Textura", gdf['textura_suelo'].iloc[0]),
+        ("Potencial", gdf['proy_rendimiento_sin_fert'])
+    ]:
+        frases.append(generar_frase_campesina(cultivo, nombre, datos))
+    
+    # Construir PDF
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    titulos = ['FERTILIDAD', 'COSECHA', 'TIERRA', 'POTENCIAL']
+    for i, img_path in enumerate(imagenes):
+        pdf.add_page()
+        pdf.set_font("Helvetica", "B", 14)
+        pdf.set_text_color(0, 80, 0)
+        pdf.cell(0, 10, f"📊 {titulos[i]}", ln=1, align='C')
+        pdf.image(img_path, x=10, y=30, w=190)
+        pdf.set_y(180)
+        pdf.set_font("Helvetica", "", 12)
+        pdf.set_text_color(50, 50, 150)
+        pdf.multi_cell(0, 8, frases[i], align='C')
+        pdf.set_y(260)
+        pdf.set_font("Helvetica", "I", 8)
+        pdf.cell(0, 5, f"Basado en imágenes satelitales - {satelite} - {fecha_fin.strftime('%d/%m/%Y')}", ln=0, align='C')
+    
+    pdf_output = os.path.join(temp_dir, f"reporte_campesino_{cultivo}.pdf")
+    pdf.output(pdf_output)
+    with open(pdf_output, "rb") as f:
+        pdf_bytes = f.read()
+    # Limpiar
+    for img in imagenes:
+        os.remove(img)
+    os.remove(pdf_output)
+    os.rmdir(temp_dir)
+    return pdf_bytes
+
 st.markdown(
     '<div style="text-align: center; padding: 20px; margin-top: 20px; border-top: 1px solid #3b82f6;">'
     '<p style="color: #94a3b8; margin: 0;">© 2026 Analizador Multi-Cultivo Satelital. Todos los derechos reservados.</p>'
     '</div>',
     unsafe_allow_html=True
+)
 )
