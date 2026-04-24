@@ -240,7 +240,7 @@ def consultar_groq(prompt, max_tokens=400):
     try:
         client = groq.Client(api_key=GROQ_API_KEY)
         response = client.chat.completions.create(
-            model="mixtral-8x7b-32768",
+            model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens,
             temperature=0.5
