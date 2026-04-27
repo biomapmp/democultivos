@@ -1,5 +1,5 @@
 # app.py - Plataforma de Gestión de Riesgos Climáticos para Ají y Rocoto
-# Versión con mapa único, cambio de fondo (Google Hybrid / Esri Satellite) y ZOOM AUTOMÁTICO al polígono.
+# Versión con mapa único, cambio de fondo (Google Hybrid / Esri Satellite) y ZOOM AUTOMÁTICO garantizado.
 
 import streamlit as st
 import geopandas as gpd
@@ -203,10 +203,12 @@ def obtener_zoom_automatico(bounds):
     minx, miny, maxx, maxy = bounds
     lat_diff = maxy - miny
     lon_diff = maxx - minx
-    # Área en grados cuadrados
+    # Área en grados cuadrados (aproximación)
     area_deg = lat_diff * lon_diff
-    # Heurística empírica
-    if area_deg < 0.0001:
+    # Heurística mejorada
+    if area_deg < 0.00001:   # muy pequeño
+        zoom = 19
+    elif area_deg < 0.0001:
         zoom = 18
     elif area_deg < 0.001:
         zoom = 16
@@ -218,8 +220,8 @@ def obtener_zoom_automatico(bounds):
         zoom = 10
     else:
         zoom = 8
-    # Limitar valores razonables
-    zoom = max(8, min(zoom, 18))
+    # Limitar entre 7 y 19
+    zoom = max(7, min(19, zoom))
     return zoom
 
 def crear_mapa_con_zoom_automatico(gdf, basemap='google_hybrid'):
@@ -283,7 +285,7 @@ def agregar_capa_gee(m, image, vis_params, nombre_capa):
         return True
     return False
 
-# Funciones para obtener imágenes EE (igual que antes)
+# Funciones para obtener imágenes EE
 def get_ndvi_image(gdf, fecha):
     region = ee.Geometry.Rectangle(gdf.total_bounds.tolist())
     col = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
@@ -572,9 +574,8 @@ with tab_mapas:
     success = agregar_capa_gee(mapa, image, vis, nombre_capa)
     if success:
         folium.LayerControl().add_to(mapa)
-        # Mostrar el mapa
         folium_static(mapa, width=800, height=600)
-        st.success(f"✅ Mapa generado con zoom automático a la parcela (zoom nivel {mapa.zoom_start}).")
+        st.success("✅ Mapa generado con zoom automático a la parcela.")
     else:
         st.error("No se pudo agregar la capa de GEE. Verifica autenticación y conectividad.")
 
