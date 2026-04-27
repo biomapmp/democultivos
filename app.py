@@ -1,6 +1,7 @@
 # app.py - Plataforma de Gestión de Riesgos Climáticos para Ají y Rocoto
 # Versión avanzada con dashboard, gráficos temporales, alertas IA mejoradas.
-# Incluye mapas interactivos con Google Hybrid y Esri Satellite para NDVI, NDRE, Temperatura, Precipitación y NDWI.
+# Incluye un mapa interactivo con cambio de fondo (Google Hybrid / Esri Satellite)
+# y zoom automático al polígono de la parcela para NDVI, NDRE, Temperatura, Precipitación y NDWI.
 
 import streamlit as st
 import geopandas as gpd
@@ -59,7 +60,6 @@ except ImportError:
 GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY", ""))
 if GROQ_API_KEY and GROQ_AVAILABLE:
     os.environ["GROQ_API_KEY"] = GROQ_API_KEY
-    # No mostramos mensaje de éxito cada vez para no saturar
 else:
     st.warning("⚠️ No se encontró API Key de Groq o librería no instalada. La IA no estará disponible.")
 
@@ -80,7 +80,7 @@ def inicializar_gee():
         except Exception as e:
             st.error(f"❌ Error con cuenta de servicio: {e}")
     try:
-        ee.Initialize(project='applied-oxygen-459415-e2')  # tu project ID
+        ee.Initialize(project='applied-oxygen-459415-e2')
         st.session_state.gee_authenticated = True
         return True
     except Exception as e:
@@ -208,7 +208,7 @@ def cargar_archivo_parcela(uploaded_file):
         st.error(f"❌ Error cargando archivo: {e}")
         return None
 
-# ================= FUNCIONES PARA MAPAS INTERACTIVOS CON GEE + FOLIUM =================
+# ================= FUNCIONES PARA MAPA INTERACTIVO CON GEE + FOLIUM =================
 def obtener_tile_url_gee(image, vis_params):
     """Obtiene la URL de tiles de una imagen EE con parámetros de visualización."""
     try:
@@ -218,15 +218,35 @@ def obtener_tile_url_gee(image, vis_params):
         st.warning(f"Error generando tile URL: {e}")
         return None
 
-def crear_mapa_base(gdf, basemap='google_hybrid'):
-    """Crea un mapa folium centrado en la parcela con el basemap seleccionado."""
+def crear_mapa_con_zoom(gdf, basemap='google_hybrid'):
+    """Crea un mapa folium centrado en la parcela con zoom ajustado a sus límites."""
     bounds = gdf.total_bounds  # [minx, miny, maxx, maxy]
     center_lat = (bounds[1] + bounds[3]) / 2
     center_lon = (bounds[0] + bounds[2]) / 2
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=13, control_scale=True)
+    # Calcular zoom automático: diferencia en grados
+    lat_diff = bounds[3] - bounds[1]
+    lon_diff = bounds[2] - bounds[0]
+    # Aproximación empírica: zoom alrededor de 12-15 para parcelas pequeñas
+    if lat_diff < 0.01 and lon_diff < 0.01:
+        zoom_start = 15
+    elif lat_diff < 0.05 and lon_diff < 0.05:
+        zoom_start = 13
+    else:
+        zoom_start = 11
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom_start, control_scale=True)
     
+    # Añadir el polígono de la parcela
+    folium.GeoJson(
+        gdf.__geo_interface__,
+        name='Parcela',
+        style_function=lambda x: {'color': 'yellow', 'weight': 3, 'fillOpacity': 0.1}
+    ).add_to(m)
+    
+    # Ajustar vista exacta a los límites (override del zoom_start)
+    m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
+    
+    # Configurar el basemap según selección
     if basemap == 'google_hybrid':
-        # Google Hybrid (satélite + etiquetas)
         folium.TileLayer(
             tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
             attr='Google',
@@ -235,7 +255,6 @@ def crear_mapa_base(gdf, basemap='google_hybrid'):
             control=True
         ).add_to(m)
     elif basemap == 'esri_satellite':
-        # Esri World Imagery (satélite)
         folium.TileLayer(
             tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
             attr='Esri',
@@ -244,18 +263,9 @@ def crear_mapa_base(gdf, basemap='google_hybrid'):
             control=True
         ).add_to(m)
     else:
-        # fallback OpenStreetMap
-        folium.TileLayer('openstreetmap').add_to(m)
+        # fallback
+        folium.TileLayer('openstreetmap', name='OSM').add_to(m)
     
-    # Añadir el polígono de la parcela
-    folium.GeoJson(
-        gdf.__geo_interface__,
-        name='Parcela',
-        style_function=lambda x: {'color': 'yellow', 'weight': 2, 'fillOpacity': 0.1}
-    ).add_to(m)
-    
-    # Ajustar vista a los límites de la parcela
-    m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
     return m
 
 def agregar_capa_gee(m, image, vis_params, nombre_capa):
@@ -272,7 +282,7 @@ def agregar_capa_gee(m, image, vis_params, nombre_capa):
         return True
     return False
 
-# Funciones para obtener la imagen EE de cada índice (adaptadas de las existentes)
+# Funciones para obtener la imagen EE de cada índice
 def get_ndvi_image(gdf, fecha):
     region = ee.Geometry.Rectangle(gdf.total_bounds.tolist())
     col = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
@@ -339,7 +349,6 @@ def get_temperature_image(gdf, fecha):
                .select('temperature_2m'))
     temp_k = col.mean().select('temperature_2m')
     temp_c = temp_k.subtract(273.15).clip(region_ampliada)
-    # Rango dinámico
     stats = temp_c.reduceRegion(reducer=ee.Reducer.minMax(), geometry=region_ampliada, scale=11132, maxPixels=1e9).getInfo()
     t_min = stats.get('temperature_2m_min', 5)
     t_max = stats.get('temperature_2m_max', 35)
@@ -463,9 +472,6 @@ df_precip = pd.DataFrame()
 df_temp = pd.DataFrame()
 if st.session_state.get("gee_authenticated", False) and usar_gee:
     with st.spinner("Descargando series temporales desde GEE..."):
-        # Nota: Estas funciones deben estar definidas en agroia_gee o adaptadas.
-        # Por simplicidad, usaremos las que ya están en el código original (se asume que existen).
-        # Si no existen, se comentan y se usan simulados.
         try:
             from agroia_gee import (
                 obtener_serie_temporal_ndvi, obtener_serie_temporal_temperatura,
@@ -486,8 +492,8 @@ else:
     st.info("GEE no autenticado o no seleccionado. Se usan datos simulados.")
 
 # ================= PESTAÑAS =================
-tab_dashboard, tab_hist, tab_monitoreo, tab_alerta, tab_gobernanza, tab_export = st.tabs(
-    ["📊 Dashboard General", "🗺️ Mapas de Riesgo", "📈 Monitoreo Fenológico", "⚠️ Alertas IA", "📄 Gobernanza", "💾 Exportar"]
+tab_dashboard, tab_mapas, tab_monitoreo, tab_alerta, tab_gobernanza, tab_export = st.tabs(
+    ["📊 Dashboard General", "🗺️ Mapa de Riesgo", "📈 Monitoreo Fenológico", "⚠️ Alertas IA", "📄 Gobernanza", "💾 Exportar"]
 )
 
 # ================= DASHBOARD GENERAL =================
@@ -562,13 +568,13 @@ with tab_dashboard:
     else:
         st.info("Ejecuta con GEE autenticado para obtener estadísticas reales.")
 
-# ================= MAPAS DE RIESGO INTERACTIVOS (NUEVA VERSIÓN) =================
-with tab_hist:
-    st.header("Mapas de Riesgo Climático Interactivos")
-    st.markdown("Selecciona un índice para visualizarlo sobre **Google Hybrid** y **Esri Satellite** simultáneamente.")
+# ================= MAPA DE RIESGO INTERACTIVO (ÚNICO, CON INTERCAMBIADOR DE FONDO) =================
+with tab_mapas:
+    st.header("Mapa de Riesgo Climático Interactivo")
+    st.markdown("Selecciona un índice y el fondo del mapa. El mapa se centrará automáticamente en tu parcela.")
     
     if not (st.session_state.get("gee_authenticated", False) and usar_gee and FOLIUM_OK and FOLIUM_STATIC_OK):
-        st.warning("⚠️ Para mapas interactivos se requiere: GEE autenticado, folium y streamlit_folium instalados.")
+        st.warning("⚠️ Para el mapa interactivo se requiere: GEE autenticado, folium y streamlit-folium instalados.")
         if not FOLIUM_OK:
             st.info("Instala: pip install folium streamlit-folium")
         st.stop()
@@ -576,56 +582,46 @@ with tab_hist:
     indice = st.selectbox("Elige el índice a visualizar", 
                           ["NDVI", "NDRE", "NDWI", "Temperatura", "Precipitación"])
     
+    # Selección de fondo de mapa
+    fondo = st.radio("Fondo del mapa", ("Google Hybrid", "Esri Satellite"), horizontal=True)
+    basemap = 'google_hybrid' if fondo == "Google Hybrid" else 'esri_satellite'
+    
     # Obtener imagen y parámetros de visualización según el índice
     with st.spinner(f"Obteniendo datos de {indice} desde GEE..."):
         if indice == "NDVI":
             image = get_ndvi_image(gdf, fecha_fin)
             vis = {'min': -0.2, 'max': 0.8, 'palette': ['red', 'yellow', 'green']}
-            nombre = "NDVI"
+            nombre_capa = "NDVI"
         elif indice == "NDRE":
             image = get_ndre_image(gdf, fecha_fin)
             vis = {'min': -0.2, 'max': 0.8, 'palette': ['red', 'yellow', 'green']}
-            nombre = "NDRE"
+            nombre_capa = "NDRE"
         elif indice == "NDWI":
             image = get_ndwi_image(gdf, fecha_fin)
             vis = {'min': -0.5, 'max': 0.5, 'palette': ['brown', 'white', 'blue']}
-            nombre = "NDWI"
+            nombre_capa = "NDWI"
         elif indice == "Temperatura":
             image, vis = get_temperature_image(gdf, fecha_fin)
-            nombre = "Temperatura (°C)"
+            nombre_capa = "Temperatura (°C)"
         elif indice == "Precipitación":
             image, vis = get_precipitation_image(gdf, fecha_fin)
-            nombre = "Precipitación (mm)"
+            nombre_capa = "Precipitación (mm)"
         else:
             st.error("Índice no reconocido")
             st.stop()
     
-    # Crear dos columnas: izquierda Google Hybrid, derecha Esri Satellite
-    col_google, col_esri = st.columns(2)
+    # Crear mapa con zoom automático al polígono
+    mapa = crear_mapa_con_zoom(gdf, basemap=basemap)
+    success = agregar_capa_gee(mapa, image, vis, nombre_capa)
+    if success:
+        folium.LayerControl().add_to(mapa)
+        folium_static(mapa, width=800, height=600)
+    else:
+        st.error("No se pudo agregar la capa de GEE al mapa. Verifica que la autenticación sea correcta.")
     
-    with col_google:
-        st.subheader(f"🗺️ {indice} - Google Hybrid")
-        mapa_google = crear_mapa_base(gdf, basemap='google_hybrid')
-        success = agregar_capa_gee(mapa_google, image, vis, nombre)
-        if success:
-            folium.LayerControl().add_to(mapa_google)
-            folium_static(mapa_google, width=500, height=450)
-        else:
-            st.error("No se pudo agregar la capa de GEE al mapa.")
-    
-    with col_esri:
-        st.subheader(f"🛰️ {indice} - Esri Satellite")
-        mapa_esri = crear_mapa_base(gdf, basemap='esri_satellite')
-        success = agregar_capa_gee(mapa_esri, image, vis, nombre)
-        if success:
-            folium.LayerControl().add_to(mapa_esri)
-            folium_static(mapa_esri, width=500, height=450)
-        else:
-            st.error("No se pudo agregar la capa de GEE al mapa.")
-    
-    st.caption("Los mapas son interactivos: puedes hacer zoom, mover y activar/desactivar capas.")
+    st.caption("Puedes activar/desactivar la capa del índice desde el control de capas (esquina superior derecha). El zoom se ajusta automáticamente a tu parcela.")
 
-# ================= MONITOREO FENOLÓGICO CON GRÁFICOS =================
+# ================= MONITOREO FENOLÓGICO =================
 with tab_monitoreo:
     st.header("Monitoreo Detallado por Fase Fenológica")
     col1, col2 = st.columns(2)
@@ -717,4 +713,4 @@ with tab_export:
         st.download_button("💧 Descargar serie Precipitación (CSV)", data=csv_precip, file_name="precipitacion_serie.csv")
 
 st.markdown("---")
-st.caption("Plataforma avanzada con IA (Groq Llama 3.3), GEE y dashboard interactivo. Versión 5.0 - Mapas interactivos con Google Hybrid y Esri Satellite.")
+st.caption("Plataforma avanzada con IA (Groq Llama 3.3), GEE y dashboard interactivo. Versión 5.1 - Mapa único con cambio de fondo y zoom automático a la parcela.")
