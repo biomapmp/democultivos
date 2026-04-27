@@ -22,7 +22,12 @@ from io import BytesIO
 import requests
 import contextily as ctx
 from PIL import Image
-
+from agroia_gee import (
+    obtener_ndvi_actual, obtener_ndwi_actual, obtener_ndre_actual,
+    obtener_temperatura_actual, obtener_precipitacion_actual,
+    obtener_serie_temporal_ndvi, obtener_serie_temporal_temperatura,
+    obtener_serie_temporal_precipitacion
+    )
 # ================= CONFIGURACIÓN INICIAL =================
 warnings.filterwarnings('ignore')
 import matplotlib
@@ -102,7 +107,7 @@ def inicializar_gee():
         except Exception as e:
             st.error(f"❌ Error con cuenta de servicio: {e}")
     try:
-        ee.Initialize()
+        ee.Initialize(project='applied-oxygen-459415-e2')  # tu project ID
         st.session_state.gee_authenticated = True
         st.success("✅ GEE autenticado localmente.")
         return True
@@ -231,106 +236,24 @@ def cargar_archivo_parcela(uploaded_file):
         st.error(f"❌ Error cargando archivo: {e}")
         return None
 
-# ================= FUNCIONES DE OBTENCIÓN DE DATOS TEMPORALES (GEE) =================
-def obtener_serie_temporal_ndvi(gdf, start_date, end_date):
-    """Retorna DataFrame con fechas y NDVI promedio diario (Sentinel-2)"""
-    try:
-        geom = ee.Geometry.Polygon(list(gdf.geometry.iloc[0].exterior.coords))
-        collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED') \
-            .filterBounds(geom) \
-            .filterDate(start_date, end_date) \
-            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
-        def add_ndvi(img):
-            ndvi = img.normalizedDifference(['B8', 'B4']).rename('NDVI')
-            return img.addBands(ndvi)
-        with_ndvi = collection.map(add_ndvi)
-        def get_daily_ndvi(img):
-            date = img.date().format('YYYY-MM-dd')
-            mean = img.select('NDVI').reduceRegion(
-                reducer=ee.Reducer.mean(),
-                geometry=geom,
-                scale=10,
-                bestEffort=True
-            ).get('NDVI')
-            return ee.Feature(None, {'date': date, 'ndvi': mean})
-        daily = with_ndvi.map(get_daily_ndvi)
-        data = daily.getInfo()
-        df = pd.DataFrame([f['properties'] for f in data['features']])
-        df['date'] = pd.to_datetime(df['date'])
-        df['ndvi'] = pd.to_numeric(df['ndvi'])
-        return df.sort_values('date')
-    except Exception as e:
-        st.error(f"Error en serie NDVI: {e}")
-        return pd.DataFrame()
-
-def obtener_serie_temporal_precipitacion(gdf, start_date, end_date):
-    """Precipitación diaria CHIRPS"""
-    try:
-        geom = ee.Geometry.Polygon(list(gdf.geometry.iloc[0].exterior.coords))
-        collection = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY') \
-            .filterBounds(geom) \
-            .filterDate(start_date, end_date) \
-            .select('precipitation')
-        def get_daily_precip(img):
-            date = img.date().format('YYYY-MM-dd')
-            mean = img.reduceRegion(
-                reducer=ee.Reducer.mean(),
-                geometry=geom,
-                scale=5000,
-                bestEffort=True
-            ).get('precipitation')
-            return ee.Feature(None, {'date': date, 'precip': mean})
-        daily = collection.map(get_daily_precip)
-        data = daily.getInfo()
-        df = pd.DataFrame([f['properties'] for f in data['features']])
-        df['date'] = pd.to_datetime(df['date'])
-        df['precip'] = pd.to_numeric(df['precip'])
-        return df.sort_values('date')
-    except Exception as e:
-        return pd.DataFrame()
-
-def obtener_serie_temporal_temperatura(gdf, start_date, end_date):
-    """Temperatura media diaria ERA5-Land"""
-    try:
-        geom = ee.Geometry.Polygon(list(gdf.geometry.iloc[0].exterior.coords))
-        collection = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR') \
-            .filterBounds(geom) \
-            .filterDate(start_date, end_date) \
-            .select('temperature_2m')
-        def get_daily_temp(img):
-            date = img.date().format('YYYY-MM-dd')
-            mean = img.reduceRegion(
-                reducer=ee.Reducer.mean(),
-                geometry=geom,
-                scale=10000,
-                bestEffort=True
-            ).get('temperature_2m')
-            return ee.Feature(None, {'date': date, 'temp': mean})
-        daily = collection.map(get_daily_temp)
-        data = daily.getInfo()
-        df = pd.DataFrame([f['properties'] for f in data['features']])
-        df['date'] = pd.to_datetime(df['date'])
-        df['temp'] = pd.to_numeric(df['temp']) - 273.15  # Kelvin a Celsius
-        return df.sort_values('date')
-    except Exception as e:
-        return pd.DataFrame()
-
 # ================= NUEVAS FUNCIONES PARA MAPAS DE CALOR (NDVI, NDRE, TEMP, PRECIP, NDWI) =================
 def obtener_imagen_gee_thumbnail(gdf, image_func, vis_params, dimensions='600x600'):
-    """Helper: genera una URL de miniatura de GEE para el área de la parcela."""
     if not st.session_state.get('gee_authenticated', False):
         return None
     try:
         bounds = gdf.total_bounds
         region = ee.Geometry.Rectangle([bounds[0], bounds[1], bounds[2], bounds[3]])
         image = image_func(region)
-        url = image.getThumbURL({
+        # Usar .visualize() para que la paleta se aplique correctamente
+        vis_image = image.visualize(
+            min=vis_params.get('min', 0),
+            max=vis_params.get('max', 1),
+            palette=vis_params.get('palette', ['blue', 'green', 'red'])
+        )
+        url = vis_image.getThumbURL({
             'region': region,
             'dimensions': dimensions,
-            'format': 'png',
-            'min': vis_params.get('min', 0),
-            'max': vis_params.get('max', 1),
-            'palette': vis_params.get('palette', ['blue', 'green', 'red'])
+            'format': 'png'
         })
         return url
     except Exception as e:
@@ -338,66 +261,142 @@ def obtener_imagen_gee_thumbnail(gdf, image_func, vis_params, dimensions='600x60
         return None
 
 def mapa_ndvi(gdf, fecha):
-    """Genera URL de mapa de calor NDVI (Sentinel-2) en la fecha más cercana disponible."""
     def build_image(region):
-        collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED') \
-            .filterBounds(region) \
-            .filterDate(fecha.strftime('%Y-%m-%d'), (fecha + timedelta(days=30)).strftime('%Y-%m-%d')) \
-            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)) \
-            .sort('CLOUDY_PIXEL_PERCENTAGE')
-        image = collection.first()
-        ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI')
-        return ndvi.clip(region)
+        col = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+               .filterBounds(region)
+               .filterDate(fecha.strftime('%Y-%m-%d'), (fecha + timedelta(days=30)).strftime('%Y-%m-%d'))
+               .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+               .sort('CLOUDY_PIXEL_PERCENTAGE'))
+        if col.size().getInfo() == 0:
+            col = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                   .filterBounds(region)
+                   .filterDate((fecha - timedelta(days=60)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
+                   .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
+                   .sort('CLOUDY_PIXEL_PERCENTAGE'))
+        return col.first().normalizedDifference(['B8', 'B4']).clip(region)
     return obtener_imagen_gee_thumbnail(gdf, build_image, {'min': -0.2, 'max': 0.8, 'palette': ['red', 'yellow', 'green']})
 
 def mapa_ndre(gdf, fecha):
-    """Genera URL de mapa de calor NDRE (Sentinel-2). NDRE = (B8A - B5) / (B8A + B5)"""
     def build_image(region):
-        collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED') \
-            .filterBounds(region) \
-            .filterDate(fecha.strftime('%Y-%m-%d'), (fecha + timedelta(days=30)).strftime('%Y-%m-%d')) \
-            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)) \
-            .sort('CLOUDY_PIXEL_PERCENTAGE')
-        image = collection.first()
-        ndre = image.normalizedDifference(['B8A', 'B5']).rename('NDRE')
-        return ndre.clip(region)
+        col = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+               .filterBounds(region)
+               .filterDate(fecha.strftime('%Y-%m-%d'), (fecha + timedelta(days=30)).strftime('%Y-%m-%d'))
+               .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+               .sort('CLOUDY_PIXEL_PERCENTAGE'))
+        if col.size().getInfo() == 0:
+            col = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                   .filterBounds(region)
+                   .filterDate((fecha - timedelta(days=60)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
+                   .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
+                   .sort('CLOUDY_PIXEL_PERCENTAGE'))
+        return col.first().normalizedDifference(['B8A', 'B5']).clip(region)
     return obtener_imagen_gee_thumbnail(gdf, build_image, {'min': -0.2, 'max': 0.8, 'palette': ['red', 'yellow', 'green']})
 
-def mapa_temperatura(gdf, fecha):
-    """Mapa de temperatura superficial (ERA5-Land) para la fecha."""
+def mapa_ndwi(gdf, fecha):
     def build_image(region):
-        collection = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR') \
-            .filterBounds(region) \
-            .filterDate(fecha.strftime('%Y-%m-%d'), (fecha + timedelta(days=1)).strftime('%Y-%m-%d')) \
-            .select('temperature_2m')
-        image = collection.first()
-        temp_c = image.subtract(273.15).rename('temp_c')
-        return temp_c.clip(region)
-    return obtener_imagen_gee_thumbnail(gdf, build_image, {'min': -5, 'max': 40, 'palette': ['blue', 'cyan', 'yellow', 'red']})
+        col = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+               .filterBounds(region)
+               .filterDate(fecha.strftime('%Y-%m-%d'), (fecha + timedelta(days=30)).strftime('%Y-%m-%d'))
+               .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+               .sort('CLOUDY_PIXEL_PERCENTAGE'))
+        if col.size().getInfo() == 0:
+            col = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                   .filterBounds(region)
+                   .filterDate((fecha - timedelta(days=60)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
+                   .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
+                   .sort('CLOUDY_PIXEL_PERCENTAGE'))
+        return col.first().normalizedDifference(['B3', 'B8']).clip(region)
+    return obtener_imagen_gee_thumbnail(gdf, build_image, {'min': -0.5, 'max': 0.5, 'palette': ['brown', 'white', 'blue']})
+
+def mapa_temperatura(gdf, fecha):
+    def build_image(region):
+        # Ampliar la región para capturar variación espacial (ERA5 tiene ~11km de resolución)
+        bounds = gdf.total_bounds
+        delta = 0.5  # ~55km de buffer
+        region_ampliada = ee.Geometry.Rectangle([
+            bounds[0] - delta, bounds[1] - delta,
+            bounds[2] + delta, bounds[3] + delta
+        ])
+        col = (ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+               .filterBounds(region_ampliada)
+               .filterDate((fecha - timedelta(days=10)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
+               .select('temperature_2m'))
+        count = col.size().getInfo()
+        if count == 0:
+            col = (ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+                   .filterBounds(region_ampliada)
+                   .filterDate((fecha - timedelta(days=30)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
+                   .select('temperature_2m'))
+        img = col.mean().subtract(273.15)
+        # Calcular rango real para escalar la paleta dinámicamente
+        stats = img.reduceRegion(
+            reducer=ee.Reducer.minMax(), geometry=region_ampliada, scale=11132, maxPixels=1e9
+        ).getInfo()
+        t_min = stats.get('temperature_2m_min', 5)
+        t_max = stats.get('temperature_2m_max', 35)
+        if t_min is None: t_min = 5
+        if t_max is None: t_max = 35
+        return img.clip(region_ampliada), {'min': round(t_min, 1), 'max': round(t_max, 1),
+                                           'palette': ['#313695','#4575b4','#74add1','#abd9e9',
+                                                       '#e0f3f8','#ffffbf','#fee090','#fdae61',
+                                                       '#f46d43','#d73027','#a50026']}
+    # Wrapper para compatibilidad con obtener_imagen_gee_thumbnail
+    if not st.session_state.get('gee_authenticated', False):
+        return None
+    try:
+        bounds = gdf.total_bounds
+        region = ee.Geometry.Rectangle([bounds[0], bounds[1], bounds[2], bounds[3]])
+        img, vis = build_image(region)
+        vis_image = img.visualize(min=vis['min'], max=vis['max'], palette=vis['palette'])
+        url = vis_image.getThumbURL({'region': img.geometry(), 'dimensions': '600x600', 'format': 'png'})
+        return url
+    except Exception as e:
+        st.warning(f"Error mapa temperatura: {e}")
+        return None
 
 def mapa_precipitacion(gdf, fecha):
-    """Mapa de precipitación diaria (CHIRPS)"""
-    def build_image(region):
-        collection = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY') \
-            .filterBounds(region) \
-            .filterDate(fecha.strftime('%Y-%m-%d'), (fecha + timedelta(days=1)).strftime('%Y-%m-%d')) \
-            .select('precipitation')
-        image = collection.first()
-        return image.clip(region)
-    return obtener_imagen_gee_thumbnail(gdf, build_image, {'min': 0, 'max': 50, 'palette': ['white', 'lightblue', 'blue', 'darkblue']})
+    if not st.session_state.get('gee_authenticated', False):
+        return None
+    try:
+        bounds = gdf.total_bounds
+        # Ampliar región para contexto regional (~1° de buffer)
+        delta = 1.0
+        region_ampliada = ee.Geometry.Rectangle([
+            bounds[0] - delta, bounds[1] - delta,
+            bounds[2] + delta, bounds[3] + delta
+        ])
+        col = (ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+               .filterBounds(region_ampliada)
+               .filterDate((fecha - timedelta(days=30)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
+               .select('precipitation'))
+        count = col.size().getInfo()
+        if count == 0:
+            col = (ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+                   .filterBounds(region_ampliada)
+                   .filterDate((fecha - timedelta(days=60)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
+                   .select('precipitation'))
+        img = col.sort('system:time_start', False).first().clip(region_ampliada)
 
-def mapa_ndwi(gdf, fecha):
-    """Mapa NDWI (Green-NIR)/(Green+NIR) para Sentinel-2."""
-    def build_image(region):
-        collection = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED') \
-            .filterBounds(region) \
-            .filterDate(fecha.strftime('%Y-%m-%d'), (fecha + timedelta(days=30)).strftime('%Y-%m-%d')) \
-            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)) \
-            .sort('CLOUDY_PIXEL_PERCENTAGE')
-        image = collection.first()
-        ndwi = image.normalizedDifference(['B3', 'B8']).rename('NDWI')
-        return ndwi.clip(region)
-    return obtener_imagen_gee_thumbnail(gdf, build_image, {'min': -0.5, 'max': 0.5, 'palette': ['brown', 'white', 'blue']})
+        # Calcular el máximo real para escalar la paleta dinámicamente
+        stats = img.reduceRegion(
+            reducer=ee.Reducer.minMax(), geometry=region_ampliada, scale=5566, maxPixels=1e9
+        ).getInfo()
+        p_max = stats.get('precipitation_max') or stats.get('precipitation_p100')
+        p_max = float(p_max) if p_max else 1.0
+        # Usar al menos 1mm como techo para que haya gradiente visible
+        vis_max = max(round(p_max * 1.1, 1), 1.0)
+
+        palette_precip = ['#f0f9e8', '#bae4bc', '#7bccc4', '#2b8cbe', '#084081']
+        vis_image = img.visualize(min=0, max=vis_max, palette=palette_precip)
+        url = vis_image.getThumbURL({
+            'region': region_ampliada,
+            'dimensions': '600x600',
+            'format': 'png'
+        })
+        return url, vis_max, palette_precip
+    except Exception as e:
+        st.warning(f"Error mapa precipitación: {e}")
+        return None, None, None
 
 # ================= FUNCIONES DE IA MEJORADAS =================
 def consultar_groq(prompt, max_tokens=600, model="llama-3.3-70b-versatile"):
@@ -460,6 +459,12 @@ with st.sidebar:
     usar_gee = st.checkbox("Usar GEE (si autenticado)", value=True)
     st.markdown("---")
     st.caption("📊 Datos satelitales: Sentinel-2, CHIRPS, ERA5-Land")
+    st.markdown("---")
+    gee_ok = st.session_state.get('gee_authenticated', False)
+    st.caption(f"GEE: {'✅ Autenticado' if gee_ok else '❌ No autenticado'}")
+    if st.button("🔄 Reintentar autenticación GEE"):
+        inicializar_gee()
+        st.rerun()
 
 if not uploaded_file:
     st.info("👈 Sube un archivo de parcela para comenzar el análisis.")
@@ -552,14 +557,26 @@ with tab_dashboard:
         st.pyplot(fig)
     
     st.subheader("Estadísticas del Período")
-    if not df_ndvi.empty:
-        df_stats = pd.DataFrame({
-            'Variable': ['NDVI', 'Temperatura (°C)', 'Precipitación (mm/día)'],
-            'Promedio': [df_ndvi['ndvi'].mean(), df_temp['temp'].mean(), df_precip['precip'].mean()],
-            'Mínimo': [df_ndvi['ndvi'].min(), df_temp['temp'].min(), df_precip['precip'].min()],
-            'Máximo': [df_ndvi['ndvi'].max(), df_temp['temp'].max(), df_precip['precip'].max()],
-        })
-        st.dataframe(df_stats.round(2))
+    stats_rows = []
+    if not df_ndvi.empty and 'ndvi' in df_ndvi.columns:
+        stats_rows.append({'Variable': 'NDVI',
+                           'Promedio': df_ndvi['ndvi'].mean(),
+                           'Mínimo': df_ndvi['ndvi'].min(),
+                           'Máximo': df_ndvi['ndvi'].max()})
+    if not df_temp.empty and 'temp' in df_temp.columns:
+        stats_rows.append({'Variable': 'Temperatura (°C)',
+                           'Promedio': df_temp['temp'].mean(),
+                           'Mínimo': df_temp['temp'].min(),
+                           'Máximo': df_temp['temp'].max()})
+    if not df_precip.empty and 'precip' in df_precip.columns:
+        stats_rows.append({'Variable': 'Precipitación (mm/día)',
+                           'Promedio': df_precip['precip'].mean(),
+                           'Mínimo': df_precip['precip'].min(),
+                           'Máximo': df_precip['precip'].max()})
+    if stats_rows:
+        st.dataframe(pd.DataFrame(stats_rows).round(2), use_container_width=True)
+    elif st.session_state.get('gee_authenticated', False):
+        st.warning("⚠️ GEE autenticado pero no retornó datos para el período seleccionado. Probá ampliar el rango de fechas.")
     else:
         st.info("Ejecuta con GEE autenticado para obtener estadísticas reales.")
 
@@ -574,11 +591,12 @@ with tab_hist:
             url_ndvi = mapa_ndvi(gdf, fecha_fin)
             url_ndre = mapa_ndre(gdf, fecha_fin)
             url_temp = mapa_temperatura(gdf, fecha_fin)
-            url_precip = mapa_precipitacion(gdf, fecha_fin)
+            url_precip, precip_vis_max, precip_palette = mapa_precipitacion(gdf, fecha_fin)
             url_ndwi = mapa_ndwi(gdf, fecha_fin)
     else:
         st.warning("GEE no autenticado o no seleccionado. Mostrando mapas simulados (simulación aleatoria).")
-        url_ndvi = url_ndre = url_temp = url_precip = url_ndwi = None
+        url_ndvi = url_ndre = url_temp = url_ndwi = None
+        url_precip, precip_vis_max, precip_palette = None, None, None
     
     # Mostrar en una cuadrícula de 2x3 (5 mapas, el último espacio vacío o combinado)
     col1, col2, col3 = st.columns(3)
@@ -587,58 +605,140 @@ with tab_hist:
         if url_ndvi:
             st.image(url_ndvi, caption="NDVI (verde = mayor vigor)", use_container_width=True)
         else:
-            fig, ax = plt.subplots(figsize=(4,4))
-            data = np.random.rand(100,100)
-            im = ax.imshow(data, cmap='RdYlGn', vmin=-0.2, vmax=0.8)
-            ax.set_title("NDVI simulado")
-            plt.colorbar(im, ax=ax, fraction=0.046)
+            fig, ax = plt.subplots(figsize=(4, 3))
+            umbral_ndvi = UMBRALES[cultivo]['NDVI_min']
+            categorias = ['Umbral mínimo', 'NDVI actual']
+            valores = [umbral_ndvi, ndvi_val]
+            colores = ['#fc8d59', '#1a9641' if ndvi_val >= umbral_ndvi else '#d73027']
+            bars = ax.bar(categorias, valores, color=colores, width=0.5)
+            ax.set_ylim(0, 1)
+            ax.set_ylabel('NDVI')
+            ax.set_title('Estado vegetativo actual', fontsize=10)
+            for bar, val in zip(bars, valores):
+                ax.text(bar.get_x() + bar.get_width()/2, val + 0.02, f'{val:.2f}', ha='center', fontsize=9)
+            for spine in ['top', 'right']:
+                ax.spines[spine].set_visible(False)
+            plt.tight_layout()
             st.pyplot(fig)
+            st.caption("⚠️ Mapa satelital no disponible para esta fecha")
         
         st.subheader("🌡️ Temperatura")
         if url_temp:
             st.image(url_temp, caption="Temperatura superficial (°C)", use_container_width=True)
         else:
-            fig, ax = plt.subplots(figsize=(4,4))
-            data = np.random.rand(100,100)*40 - 5
-            im = ax.imshow(data, cmap='RdYlBu_r', vmin=-5, vmax=40)
-            ax.set_title("Temperatura simulada")
-            plt.colorbar(im, ax=ax, fraction=0.046)
+            fig, ax = plt.subplots(figsize=(4, 3))
+            ax.barh(['Mín esperada', 'Actual', 'Máx esperada'],
+                    [UMBRALES[cultivo]['temp_min'], temp_val, UMBRALES[cultivo]['temp_max']],
+                    color=['#4292c6', '#e34a33', '#fdbb84'])
+            ax.set_xlabel('°C')
+            ax.set_title('Temperatura (referencia)', fontsize=10)
+            ax.axvline(temp_val, color='#e34a33', linestyle='--', linewidth=1.5)
+            for spine in ['top', 'right']:
+                ax.spines[spine].set_visible(False)
+            plt.tight_layout()
             st.pyplot(fig)
+            st.caption("⚠️ Mapa satelital no disponible para esta fecha")
     
     with col2:
         st.subheader("🌱 NDRE")
         if url_ndre:
             st.image(url_ndre, caption="NDRE (sensibilidad a clorofila)", use_container_width=True)
         else:
-            fig, ax = plt.subplots(figsize=(4,4))
-            data = np.random.rand(100,100)
-            im = ax.imshow(data, cmap='RdYlGn', vmin=-0.2, vmax=0.8)
-            ax.set_title("NDRE simulado")
-            plt.colorbar(im, ax=ax, fraction=0.046)
+            fig, ax = plt.subplots(figsize=(4, 3))
+            categorias = ['Umbral mínimo', 'NDRE actual']
+            ndre_ref = UMBRALES[cultivo]['NDVI_min'] * 0.85
+            valores = [ndre_ref, ndre_val if 'ndre_val' in dir() else ndre_ref * 1.1]
+            colores = ['#fc8d59', '#1a9641']
+            bars = ax.bar(categorias, valores, color=colores, width=0.5)
+            ax.set_ylim(0, 1)
+            ax.set_ylabel('NDRE')
+            ax.set_title('Contenido de clorofila (ref.)', fontsize=10)
+            for bar, val in zip(bars, valores):
+                ax.text(bar.get_x() + bar.get_width()/2, val + 0.02, f'{val:.2f}', ha='center', fontsize=9)
+            for spine in ['top', 'right']:
+                ax.spines[spine].set_visible(False)
+            plt.tight_layout()
             st.pyplot(fig)
+            st.caption("⚠️ Mapa satelital no disponible para esta fecha")
         
         st.subheader("💧 Precipitación")
+        # Determinar valor real de precipitación desde la serie ya descargada
+        precip_mapa = None
+        if not df_precip.empty and 'precip' in df_precip.columns:
+            precip_mapa = round(float(df_precip['precip'].iloc[-1]), 1)
+        elif precip_actual is not None:
+            try:
+                precip_mapa = round(float(precip_actual), 1)
+            except Exception:
+                precip_mapa = None
+
         if url_precip:
-            st.image(url_precip, caption="Precipitación diaria (mm)", use_container_width=True)
+            st.image(url_precip, use_container_width=True)
+            # Colorbar de la escala real
+            if precip_vis_max is not None and precip_palette is not None:
+                from matplotlib.colors import LinearSegmentedColormap
+                import matplotlib.colors as mcolors
+                fig_cb, ax_cb = plt.subplots(figsize=(4, 0.4))
+                fig_cb.subplots_adjust(left=0.05, right=0.95, top=1, bottom=0)
+                cmap = LinearSegmentedColormap.from_list('precip', precip_palette)
+                norm = plt.Normalize(vmin=0, vmax=precip_vis_max)
+                cb = plt.colorbar(
+                    plt.cm.ScalarMappable(norm=norm, cmap=cmap),
+                    cax=ax_cb, orientation='horizontal'
+                )
+                cb.set_label(f'Precipitación (mm)  —  máx regional: {precip_vis_max} mm', fontsize=7)
+                cb.ax.tick_params(labelsize=7)
+                fig_cb.patch.set_alpha(0)
+                ax_cb.patch.set_alpha(0)
+                st.pyplot(fig_cb)
+            if precip_mapa is not None:
+                if precip_mapa < 0.1:
+                    st.caption(f"🌤️ {precip_mapa} mm — Sin lluvia registrada.")
+                else:
+                    st.caption(f"🌧️ {precip_mapa} mm en la parcela — imagen más reciente disponible.")
         else:
-            fig, ax = plt.subplots(figsize=(4,4))
-            data = np.random.rand(100,100)*50
-            im = ax.imshow(data, cmap='Blues', vmin=0, vmax=50)
-            ax.set_title("Precipitación simulada")
-            plt.colorbar(im, ax=ax, fraction=0.046)
+            fig, ax = plt.subplots(figsize=(4, 3))
+            if not df_precip.empty:
+                df_reciente_p = df_precip.tail(30)
+                ax.bar(df_reciente_p['date'], df_reciente_p['precip'], color='#4292c6', alpha=0.8, width=1)
+                ax.set_title('Precipitación últimos 30 días (GEE)', fontsize=10)
+            else:
+                fechas_sim = pd.date_range(end=fecha_fin, periods=14, freq='D')
+                precip_sim = np.clip(np.random.exponential(max(precip_actual, 2), 14), 0, 50)
+                ax.bar(fechas_sim, precip_sim, color='#4292c6', alpha=0.8, width=0.8)
+                ax.set_title('Precipitación estimada (sin datos GEE)', fontsize=10)
+            ax.set_ylabel('mm')
+            ax.tick_params(axis='x', rotation=45, labelsize=7)
+            for spine in ['top', 'right']:
+                ax.spines[spine].set_visible(False)
+            plt.tight_layout()
             st.pyplot(fig)
+            if precip_mapa is not None:
+                st.caption(f"{'🌤️ Sin lluvia' if precip_mapa < 0.5 else '🌧️ ' + str(precip_mapa) + ' mm'} — {'mapa blanco es correcto' if precip_mapa < 0.5 else 'dato más reciente disponible'}")
+            else:
+                st.caption("⚠️ CHIRPS tiene ~3 semanas de rezago. Activá GEE para ver datos reales.")
     
     with col3:
         st.subheader("💧 NDWI")
         if url_ndwi:
             st.image(url_ndwi, caption="NDWI (contenido de agua)", use_container_width=True)
         else:
-            fig, ax = plt.subplots(figsize=(4,4))
-            data = np.random.rand(100,100)*1 - 0.5
-            im = ax.imshow(data, cmap='Blues', vmin=-0.5, vmax=0.5)
-            ax.set_title("NDWI simulado")
-            plt.colorbar(im, ax=ax, fraction=0.046)
+            fig, ax = plt.subplots(figsize=(4, 3))
+            humedad_actual = humedad_val
+            rango_min = UMBRALES[cultivo]['humedad_min']
+            rango_max = UMBRALES[cultivo]['humedad_max']
+            color = '#2171b5' if rango_min <= humedad_actual <= rango_max else '#e34a33'
+            ax.barh(['Rango óptimo min', 'Humedad actual', 'Rango óptimo máx'],
+                    [rango_min, humedad_actual, rango_max],
+                    color=['#9ecae1', color, '#9ecae1'])
+            ax.set_xlabel('NDWI / Humedad')
+            ax.set_xlim(0, 1)
+            ax.set_title('Índice de humedad (ref.)', fontsize=10)
+            for spine in ['top', 'right']:
+                ax.spines[spine].set_visible(False)
+            plt.tight_layout()
             st.pyplot(fig)
+            st.caption("⚠️ Mapa satelital no disponible para esta fecha")
         
         st.markdown("### ℹ️ Nota")
         st.info("Los mapas de calor se generan a partir de la imagen satelital más reciente disponible en el área de la parcela. Si GEE no está autenticado, se muestran simulaciones aleatorias.")
