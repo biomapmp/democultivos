@@ -1,5 +1,6 @@
 # app.py - Plataforma de Gestión de Riesgos Climáticos para Ají y Rocoto
-# Versión con mapa interactivo, panel flotante, puntos críticos y leyenda.
+# Versión con mapa interactivo, panel flotante con leyenda colapsable,
+# puntos críticos como capa independiente y control de capas.
 
 import streamlit as st
 import geopandas as gpd
@@ -14,8 +15,6 @@ import warnings
 import xml.etree.ElementTree as ET
 from io import BytesIO
 from shapely.geometry import Polygon
-import matplotlib.patches as mpatches
-from matplotlib.colors import LinearSegmentedColormap
 
 # ================= DEPENDENCIAS OPCIONALES =================
 try:
@@ -197,7 +196,7 @@ def cargar_archivo_parcela(uploaded_file):
         st.error(f"❌ Error cargando archivo: {e}")
         return None
 
-# ================= FUNCIONES PARA MAPA CON ZOOM AUTOMÁTICO Y PANEL =================
+# ================= FUNCIONES PARA MAPA CON ZOOM AUTOMÁTICO =================
 def obtener_zoom_con_margen(bounds, margin_factor=0.2):
     minx, miny, maxx, maxy = bounds
     dx = (maxx - minx) * margin_factor
@@ -341,13 +340,12 @@ def get_precipitation_image(gdf, fecha):
     vis_max = max(round(p_max * 1.1, 1), 1.0)
     return img, {'min': 0, 'max': vis_max, 'palette': ['#f0f9e8', '#bae4bc', '#7bccc4', '#2b8cbe', '#084081']}
 
-# Funciones para obtener estadísticas y puntos críticos
+# Funciones para estadísticas y puntos críticos
 def get_mean_value(image, polygon_geom):
-    """Calcula el valor medio de la imagen dentro del polígono."""
     mean_dict = image.reduceRegion(
         reducer=ee.Reducer.mean(),
         geometry=polygon_geom,
-        scale=10,  # resolución de Sentinel-2
+        scale=10,
         maxPixels=1e9
     ).getInfo()
     band_names = image.bandNames().getInfo()
@@ -356,13 +354,7 @@ def get_mean_value(image, polygon_geom):
     return None
 
 def get_critical_points(image, polygon_geom, threshold, num_points=20):
-    """
-    Retorna una lista de coordenadas (lon, lat) de puntos dentro del polígono
-    donde el valor de la imagen es < umbral (puntos críticos).
-    """
-    # Crear una máscara binaria (1 donde valor < threshold, 0 en caso contrario)
     mask = image.lt(threshold)
-    # Aplicar máscara y obtener coordenadas
     points = image.updateMask(mask).sample(
         region=polygon_geom,
         scale=10,
@@ -381,7 +373,6 @@ def get_critical_points(image, polygon_geom, threshold, num_points=20):
     return coords
 
 def determinar_riesgo(indice, valor, cultivo, umbrales):
-    """Determina nivel de riesgo basado en el valor del índice y umbrales del cultivo."""
     if indice in ["NDVI", "NDRE"]:
         umbral = umbrales.get('NDVI_min', 0.4)
         if valor >= umbral:
@@ -473,7 +464,7 @@ with st.spinner("Cargando parcela..."):
     area_ha = calcular_superficie(gdf)
     st.success(f"✅ Parcela cargada: {area_ha:.2f} ha, CRS EPSG:4326")
 
-# Datos simulados (se reemplazarán si hay GEE)
+# Datos simulados
 ndvi_val = np.random.uniform(0.3, 0.8)
 temp_val = np.random.uniform(15, 32)
 humedad_val = np.random.uniform(0.2, 0.7)
@@ -550,10 +541,10 @@ with tab_dashboard:
         axes[2].set_ylabel('Precip sim')
         st.pyplot(fig)
 
-# ================= MAPA DE RIESGO CON PANEL FLOTANTE Y PUNTOS CRÍTICOS =================
+# ================= MAPA DE RIESGO CON LEYENDA INTERACTIVA Y CAPA DE PUNTOS CRÍTICOS =================
 with tab_mapas:
     st.header("🗺️ Mapa de Riesgo Climático Interactivo")
-    st.markdown("El mapa muestra el índice seleccionado, puntos críticos (valores bajos) y un panel informativo.")
+    st.markdown("El mapa muestra el índice seleccionado. Usa el control de capas (☰) para activar/desactivar puntos críticos y el panel flotante tiene leyenda colapsable.")
     
     if not (st.session_state.get("gee_authenticated", False) and usar_gee and FOLIUM_OK and FOLIUM_STATIC_OK):
         st.warning("⚠️ Se requiere GEE autenticado, folium y streamlit-folium. Instala: pip install folium streamlit-folium")
@@ -564,12 +555,11 @@ with tab_mapas:
     basemap = 'google_hybrid' if fondo == "Google Hybrid" else 'esri_satellite'
     
     with st.spinner(f"Obteniendo datos de {indice} y calculando estadísticas... Esto puede tomar hasta 30 segundos."):
-        # Obtener la imagen y parámetros de visualización
         if indice == "NDVI":
             image = get_ndvi_image(gdf, fecha_fin)
             vis = {'min': -0.2, 'max': 0.8, 'palette': ['red', 'yellow', 'green']}
             nombre_capa = "NDVI"
-            umbral_critico = 0.2  # por debajo de 0.2 se considera punto crítico
+            umbral_critico = 0.2
         elif indice == "NDRE":
             image = get_ndre_image(gdf, fecha_fin)
             vis = {'min': -0.2, 'max': 0.8, 'palette': ['red', 'yellow', 'green']}
@@ -579,36 +569,30 @@ with tab_mapas:
             image = get_ndwi_image(gdf, fecha_fin)
             vis = {'min': -0.5, 'max': 0.5, 'palette': ['brown', 'white', 'blue']}
             nombre_capa = "NDWI"
-            umbral_critico = -0.2  # valores muy negativos indican sequía
+            umbral_critico = -0.2
         elif indice == "Temperatura":
             image, vis = get_temperature_image(gdf, fecha_fin)
             nombre_capa = "Temperatura (°C)"
-            # Para temperatura, consideramos crítico si es <10 o >35
-            umbral_critico = None  # no aplica para puntos
+            umbral_critico = None
         elif indice == "Precipitación":
             image, vis = get_precipitation_image(gdf, fecha_fin)
             nombre_capa = "Precipitación (mm)"
-            umbral_critico = 1.0  # menos de 1 mm es seco
+            umbral_critico = 1.0
         
-        # Convertir el GeoDataFrame a Geometry de EE
         polygon_geom = ee.Geometry.Polygon(gdf.geometry.iloc[0].__geo_interface__['coordinates'][0])
-        
-        # Calcular valor medio
         mean_val = get_mean_value(image, polygon_geom)
         if mean_val is None:
             mean_val = 0.0
         st.info(f"📊 Valor medio de {indice} en la parcela: {mean_val:.3f}")
         
-        # Determinar riesgo
         riesgo, emoji = determinar_riesgo(indice, mean_val, cultivo, UMBRALES[cultivo])
         
-        # Obtener puntos críticos (si aplica)
         critical_coords = []
         if umbral_critico is not None:
             critical_coords = get_critical_points(image, polygon_geom, umbral_critico, num_points=20)
         num_criticos = len(critical_coords)
         
-        # Construir mapa con zoom automático
+        # Crear mapa
         bounds = gdf.total_bounds
         centro_lat, centro_lon, zoom = obtener_zoom_con_margen(bounds, margin_factor=0.2)
         mapa = folium.Map(location=[centro_lat, centro_lon], zoom_start=zoom, control_scale=True)
@@ -620,7 +604,8 @@ with tab_mapas:
             style_function=lambda x: {'color': 'yellow', 'weight': 3, 'fillOpacity': 0.05}
         ).add_to(mapa)
         
-        # Añadir puntos críticos (círculos rojos)
+        # Grupo de puntos críticos (para poder ocultar/mostrar desde el control de capas)
+        fg_criticos = folium.FeatureGroup(name="Puntos críticos", show=True)
         for lon, lat in critical_coords:
             folium.CircleMarker(
                 location=[lat, lon],
@@ -632,9 +617,10 @@ with tab_mapas:
                 fill_opacity=0.2,
                 popup=f"⚠️ Punto crítico<br>{indice}: valor bajo<br>Lat: {lat:.5f}<br>Lon: {lon:.5f}",
                 tooltip=f"Punto crítico {indice}"
-            ).add_to(mapa)
+            ).add_to(fg_criticos)
+        fg_criticos.add_to(mapa)
         
-        # Añadir marcador central con etiqueta
+        # Marcador central
         center_lat = gdf.geometry.centroid.y.iloc[0]
         center_lon = gdf.geometry.centroid.x.iloc[0]
         html_label = f"""
@@ -648,7 +634,7 @@ with tab_mapas:
             icon=folium.DivIcon(html=html_label, icon_size=(160, 35), icon_anchor=(80, 17))
         ).add_to(mapa)
         
-        # Añadir capa de GEE
+        # Capa de GEE
         tile_url = obtener_tile_url_gee(image, vis)
         if tile_url:
             folium.TileLayer(
@@ -659,7 +645,7 @@ with tab_mapas:
                 control=True
             ).add_to(mapa)
         
-        # Añadir selección de fondo de mapa
+        # Fondo de mapa
         if basemap == 'google_hybrid':
             folium.TileLayer(
                 tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
@@ -677,13 +663,17 @@ with tab_mapas:
                 control=True
             ).add_to(mapa)
         
-        # Panel flotante (Dashboard de Decisión) - similar al ejemplo
+        # Panel flotante con leyenda colapsable (interactiva)
+        # Se construye un HTML con un botón que muestra/oculta la leyenda usando JavaScript
         panel_html = f"""
-        <div style="position: fixed; bottom: 30px; left: 30px; z-index: 1000;
+        <div id="dashboard-panel" style="position: fixed; bottom: 30px; left: 30px; z-index: 1000;
                     background: white; padding: 12px 16px; border-radius: 8px;
                     border: 1px solid #ccc; box-shadow: 2px 2px 8px rgba(0,0,0,0.2);
                     font-family: Arial; font-size: 12px; min-width: 200px;">
-            <b style="font-size:13px;">🌶️ Dashboard de Decisión</b>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <b style="font-size:13px;">🌶️ Dashboard de Decisión</b>
+                <button id="toggle-legend-btn" style="background:none; border:none; font-size:16px; cursor:pointer;">🔽</button>
+            </div>
             <hr style="margin:6px 0;">
             <b>{cultivo}:</b><br>
             {emoji} Riesgo: <b>{riesgo}</b><br>
@@ -692,9 +682,10 @@ with tab_mapas:
             <b>Puntos Críticos:</b> {num_criticos}<br>
             <span style="font-size:10px; color:#888;">Umbral {"<"+str(umbral_critico) if umbral_critico else "N/A"}</span>
             <hr style="margin:6px 0;">
-            <b>Leyenda {indice}:</b><br>
+            <div id="legend-section">
+                <b>Leyenda {indice}:</b><br>
         """
-        # Añadir leyenda de colores según el índice
+        # Leyenda según índice
         if indice in ["NDVI", "NDRE"]:
             panel_html += """
             <span style="color:#d73027;">■</span> Muy bajo (<0.2)<br>
@@ -719,9 +710,29 @@ with tab_mapas:
             <span style="color:#7bccc4;">■</span> Moderado (5-20 mm)<br>
             <span style="color:#084081;">■</span> Lluvioso (>20 mm)
             """
-        panel_html += '<hr style="margin:6px 0;"><span style="font-size:10px; color:#888;">Datos: Sentinel-2, ERA5, CHIRPS</span></div>'
+        panel_html += """
+            </div>
+            <hr style="margin:6px 0;">
+            <span style="font-size:10px; color:#888;">Datos: Sentinel-2, ERA5, CHIRPS</span>
+        </div>
+        <script>
+            var btn = document.getElementById('toggle-legend-btn');
+            var legendDiv = document.getElementById('legend-section');
+            var collapsed = false;
+            btn.onclick = function() {{
+                if (collapsed) {{
+                    legendDiv.style.display = 'block';
+                    btn.innerHTML = '🔽';
+                    collapsed = false;
+                }} else {{
+                    legendDiv.style.display = 'none';
+                    btn.innerHTML = '🔼';
+                    collapsed = true;
+                }}
+            }};
+        </script>
+        """
         
-        # Agregar el panel como un elemento HTML personalizado usando folium.Element
         from folium import Element
         Element(panel_html).add_to(mapa)
         
@@ -729,9 +740,8 @@ with tab_mapas:
         folium.LayerControl(collapsed=False).add_to(mapa)
         Fullscreen().add_to(mapa)
         
-        # Mostrar mapa
         folium_static(mapa, width=900, height=650)
-        st.success(f"✅ Mapa generado con {num_criticos} puntos críticos y panel informativo.")
+        st.success(f"✅ Mapa generado con {num_criticos} puntos críticos. La leyenda se puede ocultar con el botón 🔽/🔼.")
 
 # ================= MONITOREO FENOLÓGICO =================
 with tab_monitoreo:
@@ -793,4 +803,4 @@ with tab_export:
     if not df_ndvi.empty:
         st.download_button("Serie NDVI CSV", data=df_ndvi.to_csv(index=False), file_name="ndvi.csv")
 
-st.caption("Plataforma avanzada con panel flotante, puntos críticos y leyenda integrada.")
+st.caption("Plataforma con leyenda interactiva (colapsable) y puntos críticos como capa independiente.")
