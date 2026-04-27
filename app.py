@@ -1,5 +1,6 @@
 # app.py - Plataforma de Gestión de Riesgos Climáticos para Ají y Rocoto
-# Versión con mapa único, cambio de fondo (Google Hybrid / Esri Satellite) y ZOOM AUTOMÁTICO garantizado.
+# Versión con mapa único, cambio de fondo (Google Hybrid / Esri Satellite),
+# ZOOM AUTOMÁTICO CON MARGEN y LEYENDA EXPLICATIVA para cada índice.
 
 import streamlit as st
 import geopandas as gpd
@@ -14,6 +15,8 @@ import warnings
 import xml.etree.ElementTree as ET
 from io import BytesIO
 from shapely.geometry import Polygon
+import matplotlib.patches as mpatches
+from matplotlib.colors import LinearSegmentedColormap
 
 # ================= DEPENDENCIAS OPCIONALES =================
 try:
@@ -195,45 +198,70 @@ def cargar_archivo_parcela(uploaded_file):
         st.error(f"❌ Error cargando archivo: {e}")
         return None
 
-# ================= FUNCIONES PARA MAPA CON ZOOM AUTOMÁTICO =================
-def obtener_zoom_automatico(bounds):
+# ================= FUNCIONES PARA MAPA CON ZOOM AUTOMÁTICO (CON MARGEN) =================
+def obtener_zoom_con_margen(bounds, margin_factor=0.2):
     """
-    Calcula un nivel de zoom apropiado para Folium basado en el bounding box (minx, miny, maxx, maxy).
+    Calcula un nivel de zoom adecuado añadiendo un margen alrededor del bounding box.
+    bounds: (minx, miny, maxx, maxy)
+    margin_factor: proporción del ancho/alto a añadir como margen (0.2 = 20%).
+    Retorna (centro_lat, centro_lon, zoom).
     """
     minx, miny, maxx, maxy = bounds
+    # Añadir margen
+    dx = (maxx - minx) * margin_factor
+    dy = (maxy - miny) * margin_factor
+    minx -= dx
+    maxx += dx
+    miny -= dy
+    maxy += dy
+    
+    centro_lat = (miny + maxy) / 2
+    centro_lon = (minx + maxx) / 2
+    
+    # Calcular zoom basado en la mayor diferencia (lat o lon)
     lat_diff = maxy - miny
     lon_diff = maxx - minx
-    # Área en grados cuadrados (aproximación)
-    area_deg = lat_diff * lon_diff
-    # Heurística mejorada
-    if area_deg < 0.00001:   # muy pequeño
-        zoom = 19
-    elif area_deg < 0.0001:
-        zoom = 18
-    elif area_deg < 0.001:
-        zoom = 16
-    elif area_deg < 0.01:
-        zoom = 14
-    elif area_deg < 0.1:
-        zoom = 12
-    elif area_deg < 1:
-        zoom = 10
-    else:
-        zoom = 8
-    # Limitar entre 7 y 19
-    zoom = max(7, min(19, zoom))
-    return zoom
-
-def crear_mapa_con_zoom_automatico(gdf, basemap='google_hybrid'):
-    """
-    Crea un mapa Folium centrado en el polígono con zoom calculado automáticamente.
-    """
-    bounds = gdf.total_bounds  # [minx, miny, maxx, maxy]
-    center_lat = (bounds[1] + bounds[3]) / 2
-    center_lon = (bounds[0] + bounds[2]) / 2
-    zoom_start = obtener_zoom_automatico(bounds)
     
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom_start, control_scale=True)
+    # Heurística mejorada para zoom (valores empíricos)
+    # Para un margen del 20%, se ajusta el zoom para que se vea el polígono con espacio
+    max_diff = max(lat_diff, lon_diff)
+    if max_diff > 10:
+        zoom = 6
+    elif max_diff > 5:
+        zoom = 7
+    elif max_diff > 2:
+        zoom = 8
+    elif max_diff > 1:
+        zoom = 9
+    elif max_diff > 0.5:
+        zoom = 10
+    elif max_diff > 0.2:
+        zoom = 11
+    elif max_diff > 0.1:
+        zoom = 12
+    elif max_diff > 0.05:
+        zoom = 13
+    elif max_diff > 0.02:
+        zoom = 14
+    elif max_diff > 0.01:
+        zoom = 15
+    elif max_diff > 0.005:
+        zoom = 16
+    else:
+        zoom = 17
+    
+    # Limitar rango de zoom (evitar demasiado zoom o muy alejado)
+    zoom = max(6, min(17, zoom))
+    return centro_lat, centro_lon, zoom
+
+def crear_mapa_con_zoom_margen(gdf, basemap='google_hybrid', margin_factor=0.2):
+    """
+    Crea un mapa Folium centrado en el polígono con margen y zoom automático.
+    """
+    bounds = gdf.total_bounds
+    centro_lat, centro_lon, zoom = obtener_zoom_con_margen(bounds, margin_factor)
+    
+    m = folium.Map(location=[centro_lat, centro_lon], zoom_start=zoom, control_scale=True)
     
     # Añadir el polígono de la parcela
     folium.GeoJson(
@@ -262,6 +290,9 @@ def crear_mapa_con_zoom_automatico(gdf, basemap='google_hybrid'):
     else:
         folium.TileLayer('openstreetmap', name='OSM').add_to(m)
     
+    # Añadir control de pantalla completa
+    Fullscreen().add_to(m)
+    
     return m
 
 def obtener_tile_url_gee(image, vis_params):
@@ -285,7 +316,7 @@ def agregar_capa_gee(m, image, vis_params, nombre_capa):
         return True
     return False
 
-# Funciones para obtener imágenes EE
+# Funciones para obtener imágenes EE (igual que antes)
 def get_ndvi_image(gdf, fecha):
     region = ee.Geometry.Rectangle(gdf.total_bounds.tolist())
     col = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
@@ -378,6 +409,50 @@ def get_precipitation_image(gdf, fecha):
     p_max = float(p_max) if p_max else 1.0
     vis_max = max(round(p_max * 1.1, 1), 1.0)
     return img, {'min': 0, 'max': vis_max, 'palette': ['#f0f9e8', '#bae4bc', '#7bccc4', '#2b8cbe', '#084081']}
+
+# ================= FUNCIONES PARA LEYENDA =================
+def mostrar_leyenda(indice):
+    """Muestra una leyenda explicativa usando matplotlib."""
+    fig, ax = plt.subplots(figsize=(6, 1.5))
+    ax.axis('off')
+    if indice == "NDVI":
+        cmap = LinearSegmentedColormap.from_list('ndvi', ['red', 'yellow', 'green'])
+        norm = plt.Normalize(-0.2, 0.8)
+        sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+        cbar = plt.colorbar(sm, cax=ax, orientation='horizontal')
+        cbar.set_label('NDVI', fontsize=10)
+        ax.set_title('Valores bajos (rojo) = poca vegetación; altos (verde) = vegetación vigorosa', fontsize=8)
+    elif indice == "NDRE":
+        cmap = LinearSegmentedColormap.from_list('ndre', ['red', 'yellow', 'green'])
+        norm = plt.Normalize(-0.2, 0.8)
+        sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+        cbar = plt.colorbar(sm, cax=ax, orientation='horizontal')
+        cbar.set_label('NDRE', fontsize=10)
+        ax.set_title('Contenido de clorofila (similar a NDVI para cultivos)', fontsize=8)
+    elif indice == "NDWI":
+        cmap = LinearSegmentedColormap.from_list('ndwi', ['brown', 'white', 'blue'])
+        norm = plt.Normalize(-0.5, 0.5)
+        sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+        cbar = plt.colorbar(sm, cax=ax, orientation='horizontal')
+        cbar.set_label('NDWI', fontsize=10)
+        ax.set_title('Valores negativos (marrón) = suelo seco; positivos (azul) = agua/vegetación húmeda', fontsize=8)
+    elif indice == "Temperatura":
+        palette = ['#313695','#4575b4','#74add1','#abd9e9','#e0f3f8','#ffffbf','#fee090','#fdae61','#f46d43','#d73027','#a50026']
+        cmap = LinearSegmentedColormap.from_list('temp', palette)
+        norm = plt.Normalize(5, 35)  # rango aproximado
+        sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+        cbar = plt.colorbar(sm, cax=ax, orientation='horizontal')
+        cbar.set_label('Temperatura (°C)', fontsize=10)
+        ax.set_title('Colores fríos (azul) = temperaturas bajas; cálidos (rojo) = altas temperaturas', fontsize=8)
+    elif indice == "Precipitación":
+        palette = ['#f0f9e8', '#bae4bc', '#7bccc4', '#2b8cbe', '#084081']
+        cmap = LinearSegmentedColormap.from_list('precip', palette)
+        norm = plt.Normalize(0, 50)  # rango de ejemplo
+        sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+        cbar = plt.colorbar(sm, cax=ax, orientation='horizontal')
+        cbar.set_label('Precipitación (mm)', fontsize=10)
+        ax.set_title('Verde claro = poca lluvia; azul oscuro = mucha lluvia', fontsize=8)
+    st.pyplot(fig)
 
 # ================= FUNCIONES DE IA =================
 def consultar_groq(prompt, max_tokens=600, model="llama-3.3-70b-versatile"):
@@ -536,10 +611,10 @@ with tab_dashboard:
         axes[2].set_ylabel('Precip sim')
         st.pyplot(fig)
 
-# ================= MAPA DE RIESGO CON ZOOM AUTOMÁTICO =================
+# ================= MAPA DE RIESGO CON ZOOM AJUSTADO Y LEYENDA =================
 with tab_mapas:
     st.header("🗺️ Mapa de Riesgo Climático Interactivo")
-    st.markdown("El mapa se centra automáticamente en tu parcela. Selecciona el índice y el fondo deseado.")
+    st.markdown("El mapa se centra automáticamente en tu parcela con un margen del 20% alrededor para una mejor visualización.")
     
     if not (st.session_state.get("gee_authenticated", False) and usar_gee and FOLIUM_OK and FOLIUM_STATIC_OK):
         st.warning("⚠️ Se requiere GEE autenticado, folium y streamlit-folium. Instala: pip install folium streamlit-folium")
@@ -569,13 +644,17 @@ with tab_mapas:
             image, vis = get_precipitation_image(gdf, fecha_fin)
             nombre_capa = "Precipitación (mm)"
     
-    # Crear mapa con zoom automático
-    mapa = crear_mapa_con_zoom_automatico(gdf, basemap=basemap)
+    # Crear mapa con zoom automático y margen del 20%
+    mapa = crear_mapa_con_zoom_margen(gdf, basemap, margin_factor=0.2)
     success = agregar_capa_gee(mapa, image, vis, nombre_capa)
     if success:
         folium.LayerControl().add_to(mapa)
         folium_static(mapa, width=800, height=600)
-        st.success("✅ Mapa generado con zoom automático a la parcela.")
+        st.success("✅ Mapa generado con zoom ajustado (margen del 20%).")
+        
+        # Mostrar leyenda explicativa
+        st.markdown("### 📖 Leyenda del mapa")
+        mostrar_leyenda(indice)
     else:
         st.error("No se pudo agregar la capa de GEE. Verifica autenticación y conectividad.")
 
@@ -639,4 +718,4 @@ with tab_export:
     if not df_ndvi.empty:
         st.download_button("Serie NDVI CSV", data=df_ndvi.to_csv(index=False), file_name="ndvi.csv")
 
-st.caption("Versión con zoom automático garantizado. El mapa se centra en tu polígono al cargar.")
+st.caption("Versión con zoom automático con margen del 20% y leyenda explicativa para cada índice.")
