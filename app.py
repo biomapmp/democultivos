@@ -1,6 +1,6 @@
 # app.py - Plataforma de Gestión de Riesgos Climáticos para Ají y Rocoto
 # Versión avanzada con dashboard, gráficos temporales, alertas IA mejoradas.
-# Incluye mapas de calor para NDVI, NDRE, Temperatura, Precipitación y NDWI.
+# Incluye mapas interactivos con Google Hybrid y Esri Satellite para NDVI, NDRE, Temperatura, Precipitación y NDWI.
 
 import streamlit as st
 import geopandas as gpd
@@ -22,40 +22,14 @@ from io import BytesIO
 import requests
 import contextily as ctx
 from PIL import Image
-from agroia_gee import (
-    obtener_ndvi_actual, obtener_ndwi_actual, obtener_ndre_actual,
-    obtener_temperatura_actual, obtener_precipitacion_actual,
-    obtener_serie_temporal_ndvi, obtener_serie_temporal_temperatura,
-    obtener_serie_temporal_precipitacion
-    )
-# ================= CONFIGURACIÓN INICIAL =================
-warnings.filterwarnings('ignore')
-import matplotlib
-matplotlib.use('Agg')
 
 # ================= DEPENDENCIAS OPCIONALES =================
 FOLIUM_OK = False
-RASTERIO_OK = False
-SKIMAGE_OK = False
 try:
     import folium
     from folium.plugins import Fullscreen
     from branca.colormap import LinearColormap
     FOLIUM_OK = True
-except ImportError:
-    pass
-
-try:
-    import rasterio
-    from rasterio.transform import from_origin
-    from rasterio.crs import CRS
-    RASTERIO_OK = True
-except ImportError:
-    pass
-
-try:
-    from skimage import measure
-    SKIMAGE_OK = True
 except ImportError:
     pass
 
@@ -85,7 +59,7 @@ except ImportError:
 GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY", ""))
 if GROQ_API_KEY and GROQ_AVAILABLE:
     os.environ["GROQ_API_KEY"] = GROQ_API_KEY
-    st.success("✅ API Key de Groq cargada correctamente.")
+    # No mostramos mensaje de éxito cada vez para no saturar
 else:
     st.warning("⚠️ No se encontró API Key de Groq o librería no instalada. La IA no estará disponible.")
 
@@ -102,14 +76,12 @@ def inicializar_gee():
             )
             ee.Initialize(credentials, project=creds.get('project_id', 'democultivos'))
             st.session_state.gee_authenticated = True
-            st.success("✅ GEE autenticado con cuenta de servicio.")
             return True
         except Exception as e:
             st.error(f"❌ Error con cuenta de servicio: {e}")
     try:
         ee.Initialize(project='applied-oxygen-459415-e2')  # tu project ID
         st.session_state.gee_authenticated = True
-        st.success("✅ GEE autenticado localmente.")
         return True
     except Exception as e:
         st.session_state.gee_authenticated = False
@@ -236,167 +208,167 @@ def cargar_archivo_parcela(uploaded_file):
         st.error(f"❌ Error cargando archivo: {e}")
         return None
 
-# ================= NUEVAS FUNCIONES PARA MAPAS DE CALOR (NDVI, NDRE, TEMP, PRECIP, NDWI) =================
-def obtener_imagen_gee_thumbnail(gdf, image_func, vis_params, dimensions='600x600'):
-    if not st.session_state.get('gee_authenticated', False):
-        return None
+# ================= FUNCIONES PARA MAPAS INTERACTIVOS CON GEE + FOLIUM =================
+def obtener_tile_url_gee(image, vis_params):
+    """Obtiene la URL de tiles de una imagen EE con parámetros de visualización."""
     try:
-        bounds = gdf.total_bounds
-        region = ee.Geometry.Rectangle([bounds[0], bounds[1], bounds[2], bounds[3]])
-        image = image_func(region)
-        # Usar .visualize() para que la paleta se aplique correctamente
-        vis_image = image.visualize(
-            min=vis_params.get('min', 0),
-            max=vis_params.get('max', 1),
-            palette=vis_params.get('palette', ['blue', 'green', 'red'])
-        )
-        url = vis_image.getThumbURL({
-            'region': region,
-            'dimensions': dimensions,
-            'format': 'png'
-        })
-        return url
+        map_id = image.getMapId(vis_params)
+        return map_id['tile_fetcher'].url_format
     except Exception as e:
-        st.warning(f"Error generando thumbnail: {e}")
+        st.warning(f"Error generando tile URL: {e}")
         return None
 
-def mapa_ndvi(gdf, fecha):
-    def build_image(region):
+def crear_mapa_base(gdf, basemap='google_hybrid'):
+    """Crea un mapa folium centrado en la parcela con el basemap seleccionado."""
+    bounds = gdf.total_bounds  # [minx, miny, maxx, maxy]
+    center_lat = (bounds[1] + bounds[3]) / 2
+    center_lon = (bounds[0] + bounds[2]) / 2
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=13, control_scale=True)
+    
+    if basemap == 'google_hybrid':
+        # Google Hybrid (satélite + etiquetas)
+        folium.TileLayer(
+            tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
+            attr='Google',
+            name='Google Hybrid',
+            overlay=False,
+            control=True
+        ).add_to(m)
+    elif basemap == 'esri_satellite':
+        # Esri World Imagery (satélite)
+        folium.TileLayer(
+            tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+            attr='Esri',
+            name='Esri Satellite',
+            overlay=False,
+            control=True
+        ).add_to(m)
+    else:
+        # fallback OpenStreetMap
+        folium.TileLayer('openstreetmap').add_to(m)
+    
+    # Añadir el polígono de la parcela
+    folium.GeoJson(
+        gdf.__geo_interface__,
+        name='Parcela',
+        style_function=lambda x: {'color': 'yellow', 'weight': 2, 'fillOpacity': 0.1}
+    ).add_to(m)
+    
+    # Ajustar vista a los límites de la parcela
+    m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
+    return m
+
+def agregar_capa_gee(m, image, vis_params, nombre_capa):
+    """Agrega una capa de imagen de Earth Engine al mapa folium."""
+    tile_url = obtener_tile_url_gee(image, vis_params)
+    if tile_url:
+        folium.TileLayer(
+            tiles=tile_url,
+            attr='Google Earth Engine',
+            name=nombre_capa,
+            overlay=True,
+            control=True
+        ).add_to(m)
+        return True
+    return False
+
+# Funciones para obtener la imagen EE de cada índice (adaptadas de las existentes)
+def get_ndvi_image(gdf, fecha):
+    region = ee.Geometry.Rectangle(gdf.total_bounds.tolist())
+    col = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+           .filterBounds(region)
+           .filterDate(fecha.strftime('%Y-%m-%d'), (fecha + timedelta(days=30)).strftime('%Y-%m-%d'))
+           .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+           .sort('CLOUDY_PIXEL_PERCENTAGE'))
+    if col.size().getInfo() == 0:
         col = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
                .filterBounds(region)
-               .filterDate(fecha.strftime('%Y-%m-%d'), (fecha + timedelta(days=30)).strftime('%Y-%m-%d'))
-               .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+               .filterDate((fecha - timedelta(days=60)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
+               .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
                .sort('CLOUDY_PIXEL_PERCENTAGE'))
-        if col.size().getInfo() == 0:
-            col = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-                   .filterBounds(region)
-                   .filterDate((fecha - timedelta(days=60)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
-                   .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
-                   .sort('CLOUDY_PIXEL_PERCENTAGE'))
-        return col.first().normalizedDifference(['B8', 'B4']).clip(region)
-    return obtener_imagen_gee_thumbnail(gdf, build_image, {'min': -0.2, 'max': 0.8, 'palette': ['red', 'yellow', 'green']})
+    ndvi = col.first().normalizedDifference(['B8', 'B4']).clip(region)
+    return ndvi
 
-def mapa_ndre(gdf, fecha):
-    def build_image(region):
+def get_ndre_image(gdf, fecha):
+    region = ee.Geometry.Rectangle(gdf.total_bounds.tolist())
+    col = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+           .filterBounds(region)
+           .filterDate(fecha.strftime('%Y-%m-%d'), (fecha + timedelta(days=30)).strftime('%Y-%m-%d'))
+           .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+           .sort('CLOUDY_PIXEL_PERCENTAGE'))
+    if col.size().getInfo() == 0:
         col = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
                .filterBounds(region)
-               .filterDate(fecha.strftime('%Y-%m-%d'), (fecha + timedelta(days=30)).strftime('%Y-%m-%d'))
-               .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+               .filterDate((fecha - timedelta(days=60)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
+               .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
                .sort('CLOUDY_PIXEL_PERCENTAGE'))
-        if col.size().getInfo() == 0:
-            col = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-                   .filterBounds(region)
-                   .filterDate((fecha - timedelta(days=60)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
-                   .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
-                   .sort('CLOUDY_PIXEL_PERCENTAGE'))
-        return col.first().normalizedDifference(['B8A', 'B5']).clip(region)
-    return obtener_imagen_gee_thumbnail(gdf, build_image, {'min': -0.2, 'max': 0.8, 'palette': ['red', 'yellow', 'green']})
+    ndre = col.first().normalizedDifference(['B8A', 'B5']).clip(region)
+    return ndre
 
-def mapa_ndwi(gdf, fecha):
-    def build_image(region):
+def get_ndwi_image(gdf, fecha):
+    region = ee.Geometry.Rectangle(gdf.total_bounds.tolist())
+    col = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+           .filterBounds(region)
+           .filterDate(fecha.strftime('%Y-%m-%d'), (fecha + timedelta(days=30)).strftime('%Y-%m-%d'))
+           .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+           .sort('CLOUDY_PIXEL_PERCENTAGE'))
+    if col.size().getInfo() == 0:
         col = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
                .filterBounds(region)
-               .filterDate(fecha.strftime('%Y-%m-%d'), (fecha + timedelta(days=30)).strftime('%Y-%m-%d'))
-               .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+               .filterDate((fecha - timedelta(days=60)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
+               .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
                .sort('CLOUDY_PIXEL_PERCENTAGE'))
-        if col.size().getInfo() == 0:
-            col = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-                   .filterBounds(region)
-                   .filterDate((fecha - timedelta(days=60)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
-                   .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
-                   .sort('CLOUDY_PIXEL_PERCENTAGE'))
-        return col.first().normalizedDifference(['B3', 'B8']).clip(region)
-    return obtener_imagen_gee_thumbnail(gdf, build_image, {'min': -0.5, 'max': 0.5, 'palette': ['brown', 'white', 'blue']})
+    ndwi = col.first().normalizedDifference(['B3', 'B8']).clip(region)
+    return ndwi
 
-def mapa_temperatura(gdf, fecha):
-    def build_image(region):
-        # Ampliar la región para capturar variación espacial (ERA5 tiene ~11km de resolución)
-        bounds = gdf.total_bounds
-        delta = 0.5  # ~55km de buffer
-        region_ampliada = ee.Geometry.Rectangle([
-            bounds[0] - delta, bounds[1] - delta,
-            bounds[2] + delta, bounds[3] + delta
-        ])
+def get_temperature_image(gdf, fecha):
+    bounds = gdf.total_bounds
+    delta = 0.5
+    region_ampliada = ee.Geometry.Rectangle([
+        bounds[0] - delta, bounds[1] - delta,
+        bounds[2] + delta, bounds[3] + delta
+    ])
+    col = (ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+           .filterBounds(region_ampliada)
+           .filterDate((fecha - timedelta(days=10)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
+           .select('temperature_2m'))
+    if col.size().getInfo() == 0:
         col = (ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
                .filterBounds(region_ampliada)
-               .filterDate((fecha - timedelta(days=10)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
+               .filterDate((fecha - timedelta(days=30)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
                .select('temperature_2m'))
-        count = col.size().getInfo()
-        if count == 0:
-            col = (ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
-                   .filterBounds(region_ampliada)
-                   .filterDate((fecha - timedelta(days=30)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
-                   .select('temperature_2m'))
-        img = col.mean().subtract(273.15)
-        # Calcular rango real para escalar la paleta dinámicamente
-        stats = img.reduceRegion(
-            reducer=ee.Reducer.minMax(), geometry=region_ampliada, scale=11132, maxPixels=1e9
-        ).getInfo()
-        t_min = stats.get('temperature_2m_min', 5)
-        t_max = stats.get('temperature_2m_max', 35)
-        if t_min is None: t_min = 5
-        if t_max is None: t_max = 35
-        return img.clip(region_ampliada), {'min': round(t_min, 1), 'max': round(t_max, 1),
-                                           'palette': ['#313695','#4575b4','#74add1','#abd9e9',
-                                                       '#e0f3f8','#ffffbf','#fee090','#fdae61',
-                                                       '#f46d43','#d73027','#a50026']}
-    # Wrapper para compatibilidad con obtener_imagen_gee_thumbnail
-    if not st.session_state.get('gee_authenticated', False):
-        return None
-    try:
-        bounds = gdf.total_bounds
-        region = ee.Geometry.Rectangle([bounds[0], bounds[1], bounds[2], bounds[3]])
-        img, vis = build_image(region)
-        vis_image = img.visualize(min=vis['min'], max=vis['max'], palette=vis['palette'])
-        url = vis_image.getThumbURL({'region': img.geometry(), 'dimensions': '600x600', 'format': 'png'})
-        return url
-    except Exception as e:
-        st.warning(f"Error mapa temperatura: {e}")
-        return None
+    temp_k = col.mean().select('temperature_2m')
+    temp_c = temp_k.subtract(273.15).clip(region_ampliada)
+    # Rango dinámico
+    stats = temp_c.reduceRegion(reducer=ee.Reducer.minMax(), geometry=region_ampliada, scale=11132, maxPixels=1e9).getInfo()
+    t_min = stats.get('temperature_2m_min', 5)
+    t_max = stats.get('temperature_2m_max', 35)
+    if t_min is None: t_min = 5
+    if t_max is None: t_max = 35
+    return temp_c, {'min': float(t_min), 'max': float(t_max), 'palette': ['#313695','#4575b4','#74add1','#abd9e9','#e0f3f8','#ffffbf','#fee090','#fdae61','#f46d43','#d73027','#a50026']}
 
-def mapa_precipitacion(gdf, fecha):
-    if not st.session_state.get('gee_authenticated', False):
-        return None
-    try:
-        bounds = gdf.total_bounds
-        # Ampliar región para contexto regional (~1° de buffer)
-        delta = 1.0
-        region_ampliada = ee.Geometry.Rectangle([
-            bounds[0] - delta, bounds[1] - delta,
-            bounds[2] + delta, bounds[3] + delta
-        ])
+def get_precipitation_image(gdf, fecha):
+    bounds = gdf.total_bounds
+    delta = 1.0
+    region_ampliada = ee.Geometry.Rectangle([
+        bounds[0] - delta, bounds[1] - delta,
+        bounds[2] + delta, bounds[3] + delta
+    ])
+    col = (ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+           .filterBounds(region_ampliada)
+           .filterDate((fecha - timedelta(days=30)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
+           .select('precipitation'))
+    if col.size().getInfo() == 0:
         col = (ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
                .filterBounds(region_ampliada)
-               .filterDate((fecha - timedelta(days=30)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
+               .filterDate((fecha - timedelta(days=60)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
                .select('precipitation'))
-        count = col.size().getInfo()
-        if count == 0:
-            col = (ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
-                   .filterBounds(region_ampliada)
-                   .filterDate((fecha - timedelta(days=60)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
-                   .select('precipitation'))
-        img = col.sort('system:time_start', False).first().clip(region_ampliada)
-
-        # Calcular el máximo real para escalar la paleta dinámicamente
-        stats = img.reduceRegion(
-            reducer=ee.Reducer.minMax(), geometry=region_ampliada, scale=5566, maxPixels=1e9
-        ).getInfo()
-        p_max = stats.get('precipitation_max') or stats.get('precipitation_p100')
-        p_max = float(p_max) if p_max else 1.0
-        # Usar al menos 1mm como techo para que haya gradiente visible
-        vis_max = max(round(p_max * 1.1, 1), 1.0)
-
-        palette_precip = ['#f0f9e8', '#bae4bc', '#7bccc4', '#2b8cbe', '#084081']
-        vis_image = img.visualize(min=0, max=vis_max, palette=palette_precip)
-        url = vis_image.getThumbURL({
-            'region': region_ampliada,
-            'dimensions': '600x600',
-            'format': 'png'
-        })
-        return url, vis_max, palette_precip
-    except Exception as e:
-        st.warning(f"Error mapa precipitación: {e}")
-        return None, None, None
+    img = col.sort('system:time_start', False).first().clip(region_ampliada)
+    stats = img.reduceRegion(reducer=ee.Reducer.max(), geometry=region_ampliada, scale=5566, maxPixels=1e9).getInfo()
+    p_max = stats.get('precipitation_max', 1.0)
+    p_max = float(p_max) if p_max else 1.0
+    vis_max = max(round(p_max * 1.1, 1), 1.0)
+    return img, {'min': 0, 'max': vis_max, 'palette': ['#f0f9e8', '#bae4bc', '#7bccc4', '#2b8cbe', '#084081']}
 
 # ================= FUNCIONES DE IA MEJORADAS =================
 def consultar_groq(prompt, max_tokens=600, model="llama-3.3-70b-versatile"):
@@ -491,15 +463,25 @@ df_precip = pd.DataFrame()
 df_temp = pd.DataFrame()
 if st.session_state.get("gee_authenticated", False) and usar_gee:
     with st.spinner("Descargando series temporales desde GEE..."):
-        df_ndvi = obtener_serie_temporal_ndvi(gdf, fecha_inicio.strftime('%Y-%m-%d'), fecha_fin.strftime('%Y-%m-%d'))
-        df_precip = obtener_serie_temporal_precipitacion(gdf, fecha_inicio.strftime('%Y-%m-%d'), fecha_fin.strftime('%Y-%m-%d'))
-        df_temp = obtener_serie_temporal_temperatura(gdf, fecha_inicio.strftime('%Y-%m-%d'), fecha_fin.strftime('%Y-%m-%d'))
-        if not df_ndvi.empty:
-            ndvi_val = df_ndvi['ndvi'].iloc[-1]
-        if not df_temp.empty:
-            temp_val = df_temp['temp'].iloc[-1]
-        if not df_precip.empty:
-            precip_actual = df_precip['precip'].iloc[-1]
+        # Nota: Estas funciones deben estar definidas en agroia_gee o adaptadas.
+        # Por simplicidad, usaremos las que ya están en el código original (se asume que existen).
+        # Si no existen, se comentan y se usan simulados.
+        try:
+            from agroia_gee import (
+                obtener_serie_temporal_ndvi, obtener_serie_temporal_temperatura,
+                obtener_serie_temporal_precipitacion
+            )
+            df_ndvi = obtener_serie_temporal_ndvi(gdf, fecha_inicio.strftime('%Y-%m-%d'), fecha_fin.strftime('%Y-%m-%d'))
+            df_precip = obtener_serie_temporal_precipitacion(gdf, fecha_inicio.strftime('%Y-%m-%d'), fecha_fin.strftime('%Y-%m-%d'))
+            df_temp = obtener_serie_temporal_temperatura(gdf, fecha_inicio.strftime('%Y-%m-%d'), fecha_fin.strftime('%Y-%m-%d'))
+            if not df_ndvi.empty:
+                ndvi_val = df_ndvi['ndvi'].iloc[-1]
+            if not df_temp.empty:
+                temp_val = df_temp['temp'].iloc[-1]
+            if not df_precip.empty:
+                precip_actual = df_precip['precip'].iloc[-1]
+        except ImportError:
+            st.info("Módulo agroia_gee no encontrado. Usando datos simulados.")
 else:
     st.info("GEE no autenticado o no seleccionado. Se usan datos simulados.")
 
@@ -580,168 +562,68 @@ with tab_dashboard:
     else:
         st.info("Ejecuta con GEE autenticado para obtener estadísticas reales.")
 
-# ================= MAPAS DE RIESGO (CALOR) CON NDVI, NDRE, TEMP, PRECIP, NDWI =================
+# ================= MAPAS DE RIESGO INTERACTIVOS (NUEVA VERSIÓN) =================
 with tab_hist:
-    st.header("Mapas de Riesgo Climático (Heatmaps)")
-    st.markdown("Visualización de NDVI, NDRE, Temperatura, Precipitación y NDWI sobre la parcela.")
+    st.header("Mapas de Riesgo Climático Interactivos")
+    st.markdown("Selecciona un índice para visualizarlo sobre **Google Hybrid** y **Esri Satellite** simultáneamente.")
     
-    use_gee_maps = st.session_state.get("gee_authenticated", False) and usar_gee
-    if use_gee_maps:
-        with st.spinner("Generando mapas desde GEE..."):
-            url_ndvi = mapa_ndvi(gdf, fecha_fin)
-            url_ndre = mapa_ndre(gdf, fecha_fin)
-            url_temp = mapa_temperatura(gdf, fecha_fin)
-            url_precip, precip_vis_max, precip_palette = mapa_precipitacion(gdf, fecha_fin)
-            url_ndwi = mapa_ndwi(gdf, fecha_fin)
-    else:
-        st.warning("GEE no autenticado o no seleccionado. Mostrando mapas simulados (simulación aleatoria).")
-        url_ndvi = url_ndre = url_temp = url_ndwi = None
-        url_precip, precip_vis_max, precip_palette = None, None, None
+    if not (st.session_state.get("gee_authenticated", False) and usar_gee and FOLIUM_OK and FOLIUM_STATIC_OK):
+        st.warning("⚠️ Para mapas interactivos se requiere: GEE autenticado, folium y streamlit_folium instalados.")
+        if not FOLIUM_OK:
+            st.info("Instala: pip install folium streamlit-folium")
+        st.stop()
     
-    # Mostrar en una cuadrícula de 2x3 (5 mapas, el último espacio vacío o combinado)
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.subheader("🌿 NDVI")
-        if url_ndvi:
-            st.image(url_ndvi, caption="NDVI (verde = mayor vigor)", use_container_width=True)
-        else:
-            fig, ax = plt.subplots(figsize=(4, 3))
-            umbral_ndvi = UMBRALES[cultivo]['NDVI_min']
-            categorias = ['Umbral mínimo', 'NDVI actual']
-            valores = [umbral_ndvi, ndvi_val]
-            colores = ['#fc8d59', '#1a9641' if ndvi_val >= umbral_ndvi else '#d73027']
-            bars = ax.bar(categorias, valores, color=colores, width=0.5)
-            ax.set_ylim(0, 1)
-            ax.set_ylabel('NDVI')
-            ax.set_title('Estado vegetativo actual', fontsize=10)
-            for bar, val in zip(bars, valores):
-                ax.text(bar.get_x() + bar.get_width()/2, val + 0.02, f'{val:.2f}', ha='center', fontsize=9)
-            for spine in ['top', 'right']:
-                ax.spines[spine].set_visible(False)
-            plt.tight_layout()
-            st.pyplot(fig)
-            st.caption("⚠️ Mapa satelital no disponible para esta fecha")
-        
-        st.subheader("🌡️ Temperatura")
-        if url_temp:
-            st.image(url_temp, caption="Temperatura superficial (°C)", use_container_width=True)
-        else:
-            fig, ax = plt.subplots(figsize=(4, 3))
-            ax.barh(['Mín esperada', 'Actual', 'Máx esperada'],
-                    [UMBRALES[cultivo]['temp_min'], temp_val, UMBRALES[cultivo]['temp_max']],
-                    color=['#4292c6', '#e34a33', '#fdbb84'])
-            ax.set_xlabel('°C')
-            ax.set_title('Temperatura (referencia)', fontsize=10)
-            ax.axvline(temp_val, color='#e34a33', linestyle='--', linewidth=1.5)
-            for spine in ['top', 'right']:
-                ax.spines[spine].set_visible(False)
-            plt.tight_layout()
-            st.pyplot(fig)
-            st.caption("⚠️ Mapa satelital no disponible para esta fecha")
+    indice = st.selectbox("Elige el índice a visualizar", 
+                          ["NDVI", "NDRE", "NDWI", "Temperatura", "Precipitación"])
     
-    with col2:
-        st.subheader("🌱 NDRE")
-        if url_ndre:
-            st.image(url_ndre, caption="NDRE (sensibilidad a clorofila)", use_container_width=True)
+    # Obtener imagen y parámetros de visualización según el índice
+    with st.spinner(f"Obteniendo datos de {indice} desde GEE..."):
+        if indice == "NDVI":
+            image = get_ndvi_image(gdf, fecha_fin)
+            vis = {'min': -0.2, 'max': 0.8, 'palette': ['red', 'yellow', 'green']}
+            nombre = "NDVI"
+        elif indice == "NDRE":
+            image = get_ndre_image(gdf, fecha_fin)
+            vis = {'min': -0.2, 'max': 0.8, 'palette': ['red', 'yellow', 'green']}
+            nombre = "NDRE"
+        elif indice == "NDWI":
+            image = get_ndwi_image(gdf, fecha_fin)
+            vis = {'min': -0.5, 'max': 0.5, 'palette': ['brown', 'white', 'blue']}
+            nombre = "NDWI"
+        elif indice == "Temperatura":
+            image, vis = get_temperature_image(gdf, fecha_fin)
+            nombre = "Temperatura (°C)"
+        elif indice == "Precipitación":
+            image, vis = get_precipitation_image(gdf, fecha_fin)
+            nombre = "Precipitación (mm)"
         else:
-            fig, ax = plt.subplots(figsize=(4, 3))
-            categorias = ['Umbral mínimo', 'NDRE actual']
-            ndre_ref = UMBRALES[cultivo]['NDVI_min'] * 0.85
-            valores = [ndre_ref, ndre_val if 'ndre_val' in dir() else ndre_ref * 1.1]
-            colores = ['#fc8d59', '#1a9641']
-            bars = ax.bar(categorias, valores, color=colores, width=0.5)
-            ax.set_ylim(0, 1)
-            ax.set_ylabel('NDRE')
-            ax.set_title('Contenido de clorofila (ref.)', fontsize=10)
-            for bar, val in zip(bars, valores):
-                ax.text(bar.get_x() + bar.get_width()/2, val + 0.02, f'{val:.2f}', ha='center', fontsize=9)
-            for spine in ['top', 'right']:
-                ax.spines[spine].set_visible(False)
-            plt.tight_layout()
-            st.pyplot(fig)
-            st.caption("⚠️ Mapa satelital no disponible para esta fecha")
-        
-        st.subheader("💧 Precipitación")
-        # Determinar valor real de precipitación desde la serie ya descargada
-        precip_mapa = None
-        if not df_precip.empty and 'precip' in df_precip.columns:
-            precip_mapa = round(float(df_precip['precip'].iloc[-1]), 1)
-        elif precip_actual is not None:
-            try:
-                precip_mapa = round(float(precip_actual), 1)
-            except Exception:
-                precip_mapa = None
-
-        if url_precip:
-            st.image(url_precip, use_container_width=True)
-            # Colorbar de la escala real
-            if precip_vis_max is not None and precip_palette is not None:
-                from matplotlib.colors import LinearSegmentedColormap
-                import matplotlib.colors as mcolors
-                fig_cb, ax_cb = plt.subplots(figsize=(4, 0.4))
-                fig_cb.subplots_adjust(left=0.05, right=0.95, top=1, bottom=0)
-                cmap = LinearSegmentedColormap.from_list('precip', precip_palette)
-                norm = plt.Normalize(vmin=0, vmax=precip_vis_max)
-                cb = plt.colorbar(
-                    plt.cm.ScalarMappable(norm=norm, cmap=cmap),
-                    cax=ax_cb, orientation='horizontal'
-                )
-                cb.set_label(f'Precipitación (mm)  —  máx regional: {precip_vis_max} mm', fontsize=7)
-                cb.ax.tick_params(labelsize=7)
-                fig_cb.patch.set_alpha(0)
-                ax_cb.patch.set_alpha(0)
-                st.pyplot(fig_cb)
-            if precip_mapa is not None:
-                if precip_mapa < 0.1:
-                    st.caption(f"🌤️ {precip_mapa} mm — Sin lluvia registrada.")
-                else:
-                    st.caption(f"🌧️ {precip_mapa} mm en la parcela — imagen más reciente disponible.")
-        else:
-            fig, ax = plt.subplots(figsize=(4, 3))
-            if not df_precip.empty:
-                df_reciente_p = df_precip.tail(30)
-                ax.bar(df_reciente_p['date'], df_reciente_p['precip'], color='#4292c6', alpha=0.8, width=1)
-                ax.set_title('Precipitación últimos 30 días (GEE)', fontsize=10)
-            else:
-                fechas_sim = pd.date_range(end=fecha_fin, periods=14, freq='D')
-                precip_sim = np.clip(np.random.exponential(max(precip_actual, 2), 14), 0, 50)
-                ax.bar(fechas_sim, precip_sim, color='#4292c6', alpha=0.8, width=0.8)
-                ax.set_title('Precipitación estimada (sin datos GEE)', fontsize=10)
-            ax.set_ylabel('mm')
-            ax.tick_params(axis='x', rotation=45, labelsize=7)
-            for spine in ['top', 'right']:
-                ax.spines[spine].set_visible(False)
-            plt.tight_layout()
-            st.pyplot(fig)
-            if precip_mapa is not None:
-                st.caption(f"{'🌤️ Sin lluvia' if precip_mapa < 0.5 else '🌧️ ' + str(precip_mapa) + ' mm'} — {'mapa blanco es correcto' if precip_mapa < 0.5 else 'dato más reciente disponible'}")
-            else:
-                st.caption("⚠️ CHIRPS tiene ~3 semanas de rezago. Activá GEE para ver datos reales.")
+            st.error("Índice no reconocido")
+            st.stop()
     
-    with col3:
-        st.subheader("💧 NDWI")
-        if url_ndwi:
-            st.image(url_ndwi, caption="NDWI (contenido de agua)", use_container_width=True)
+    # Crear dos columnas: izquierda Google Hybrid, derecha Esri Satellite
+    col_google, col_esri = st.columns(2)
+    
+    with col_google:
+        st.subheader(f"🗺️ {indice} - Google Hybrid")
+        mapa_google = crear_mapa_base(gdf, basemap='google_hybrid')
+        success = agregar_capa_gee(mapa_google, image, vis, nombre)
+        if success:
+            folium.LayerControl().add_to(mapa_google)
+            folium_static(mapa_google, width=500, height=450)
         else:
-            fig, ax = plt.subplots(figsize=(4, 3))
-            humedad_actual = humedad_val
-            rango_min = UMBRALES[cultivo]['humedad_min']
-            rango_max = UMBRALES[cultivo]['humedad_max']
-            color = '#2171b5' if rango_min <= humedad_actual <= rango_max else '#e34a33'
-            ax.barh(['Rango óptimo min', 'Humedad actual', 'Rango óptimo máx'],
-                    [rango_min, humedad_actual, rango_max],
-                    color=['#9ecae1', color, '#9ecae1'])
-            ax.set_xlabel('NDWI / Humedad')
-            ax.set_xlim(0, 1)
-            ax.set_title('Índice de humedad (ref.)', fontsize=10)
-            for spine in ['top', 'right']:
-                ax.spines[spine].set_visible(False)
-            plt.tight_layout()
-            st.pyplot(fig)
-            st.caption("⚠️ Mapa satelital no disponible para esta fecha")
-        
-        st.markdown("### ℹ️ Nota")
-        st.info("Los mapas de calor se generan a partir de la imagen satelital más reciente disponible en el área de la parcela. Si GEE no está autenticado, se muestran simulaciones aleatorias.")
+            st.error("No se pudo agregar la capa de GEE al mapa.")
+    
+    with col_esri:
+        st.subheader(f"🛰️ {indice} - Esri Satellite")
+        mapa_esri = crear_mapa_base(gdf, basemap='esri_satellite')
+        success = agregar_capa_gee(mapa_esri, image, vis, nombre)
+        if success:
+            folium.LayerControl().add_to(mapa_esri)
+            folium_static(mapa_esri, width=500, height=450)
+        else:
+            st.error("No se pudo agregar la capa de GEE al mapa.")
+    
+    st.caption("Los mapas son interactivos: puedes hacer zoom, mover y activar/desactivar capas.")
 
 # ================= MONITOREO FENOLÓGICO CON GRÁFICOS =================
 with tab_monitoreo:
@@ -835,4 +717,4 @@ with tab_export:
         st.download_button("💧 Descargar serie Precipitación (CSV)", data=csv_precip, file_name="precipitacion_serie.csv")
 
 st.markdown("---")
-st.caption("Plataforma avanzada con IA (Groq Llama 3.3), GEE y dashboard interactivo. Versión 4.0 - Mapas de calor NDVI y NDRE integrados.")
+st.caption("Plataforma avanzada con IA (Groq Llama 3.3), GEE y dashboard interactivo. Versión 5.0 - Mapas interactivos con Google Hybrid y Esri Satellite.")
