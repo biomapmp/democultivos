@@ -1,7 +1,5 @@
 # app.py - Plataforma de Gestión de Riesgos Climáticos para Ají y Rocoto
-# Versión avanzada con dashboard, gráficos temporales, alertas IA mejoradas.
-# Incluye un mapa interactivo con cambio de fondo (Google Hybrid / Esri Satellite)
-# y zoom automático al polígono de la parcela para NDVI, NDRE, Temperatura, Precipitación y NDWI.
+# Versión con mapa único, cambio de fondo (Google Hybrid / Esri Satellite) y ZOOM AUTOMÁTICO al polígono.
 
 import streamlit as st
 import geopandas as gpd
@@ -12,27 +10,18 @@ import os
 import zipfile
 from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap
-import io
-from shapely.geometry import Polygon, Point
-import math
 import warnings
 import xml.etree.ElementTree as ET
-import json
 from io import BytesIO
-import requests
-import contextily as ctx
-from PIL import Image
+from shapely.geometry import Polygon
 
 # ================= DEPENDENCIAS OPCIONALES =================
-FOLIUM_OK = False
 try:
     import folium
     from folium.plugins import Fullscreen
-    from branca.colormap import LinearColormap
     FOLIUM_OK = True
 except ImportError:
-    pass
+    FOLIUM_OK = False
 
 try:
     from streamlit_folium import folium_static
@@ -60,8 +49,6 @@ except ImportError:
 GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY", ""))
 if GROQ_API_KEY and GROQ_AVAILABLE:
     os.environ["GROQ_API_KEY"] = GROQ_API_KEY
-else:
-    st.warning("⚠️ No se encontró API Key de Groq o librería no instalada. La IA no estará disponible.")
 
 # ================= INICIALIZACIÓN DE GEE =================
 def inicializar_gee():
@@ -208,31 +195,42 @@ def cargar_archivo_parcela(uploaded_file):
         st.error(f"❌ Error cargando archivo: {e}")
         return None
 
-# ================= FUNCIONES PARA MAPA INTERACTIVO CON GEE + FOLIUM =================
-def obtener_tile_url_gee(image, vis_params):
-    """Obtiene la URL de tiles de una imagen EE con parámetros de visualización."""
-    try:
-        map_id = image.getMapId(vis_params)
-        return map_id['tile_fetcher'].url_format
-    except Exception as e:
-        st.warning(f"Error generando tile URL: {e}")
-        return None
+# ================= FUNCIONES PARA MAPA CON ZOOM AUTOMÁTICO =================
+def obtener_zoom_automatico(bounds):
+    """
+    Calcula un nivel de zoom apropiado para Folium basado en el bounding box (minx, miny, maxx, maxy).
+    """
+    minx, miny, maxx, maxy = bounds
+    lat_diff = maxy - miny
+    lon_diff = maxx - minx
+    # Área en grados cuadrados
+    area_deg = lat_diff * lon_diff
+    # Heurística empírica
+    if area_deg < 0.0001:
+        zoom = 18
+    elif area_deg < 0.001:
+        zoom = 16
+    elif area_deg < 0.01:
+        zoom = 14
+    elif area_deg < 0.1:
+        zoom = 12
+    elif area_deg < 1:
+        zoom = 10
+    else:
+        zoom = 8
+    # Limitar valores razonables
+    zoom = max(8, min(zoom, 18))
+    return zoom
 
-def crear_mapa_con_zoom(gdf, basemap='google_hybrid'):
-    """Crea un mapa folium centrado en la parcela con zoom ajustado a sus límites."""
+def crear_mapa_con_zoom_automatico(gdf, basemap='google_hybrid'):
+    """
+    Crea un mapa Folium centrado en el polígono con zoom calculado automáticamente.
+    """
     bounds = gdf.total_bounds  # [minx, miny, maxx, maxy]
     center_lat = (bounds[1] + bounds[3]) / 2
     center_lon = (bounds[0] + bounds[2]) / 2
-    # Calcular zoom automático: diferencia en grados
-    lat_diff = bounds[3] - bounds[1]
-    lon_diff = bounds[2] - bounds[0]
-    # Aproximación empírica: zoom alrededor de 12-15 para parcelas pequeñas
-    if lat_diff < 0.01 and lon_diff < 0.01:
-        zoom_start = 15
-    elif lat_diff < 0.05 and lon_diff < 0.05:
-        zoom_start = 13
-    else:
-        zoom_start = 11
+    zoom_start = obtener_zoom_automatico(bounds)
+    
     m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom_start, control_scale=True)
     
     # Añadir el polígono de la parcela
@@ -242,10 +240,7 @@ def crear_mapa_con_zoom(gdf, basemap='google_hybrid'):
         style_function=lambda x: {'color': 'yellow', 'weight': 3, 'fillOpacity': 0.1}
     ).add_to(m)
     
-    # Ajustar vista exacta a los límites (override del zoom_start)
-    m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
-    
-    # Configurar el basemap según selección
+    # Configurar el basemap
     if basemap == 'google_hybrid':
         folium.TileLayer(
             tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
@@ -263,13 +258,19 @@ def crear_mapa_con_zoom(gdf, basemap='google_hybrid'):
             control=True
         ).add_to(m)
     else:
-        # fallback
         folium.TileLayer('openstreetmap', name='OSM').add_to(m)
     
     return m
 
+def obtener_tile_url_gee(image, vis_params):
+    try:
+        map_id = image.getMapId(vis_params)
+        return map_id['tile_fetcher'].url_format
+    except Exception as e:
+        st.warning(f"Error generando tile URL: {e}")
+        return None
+
 def agregar_capa_gee(m, image, vis_params, nombre_capa):
-    """Agrega una capa de imagen de Earth Engine al mapa folium."""
     tile_url = obtener_tile_url_gee(image, vis_params)
     if tile_url:
         folium.TileLayer(
@@ -282,7 +283,7 @@ def agregar_capa_gee(m, image, vis_params, nombre_capa):
         return True
     return False
 
-# Funciones para obtener la imagen EE de cada índice
+# Funciones para obtener imágenes EE (igual que antes)
 def get_ndvi_image(gdf, fecha):
     region = ee.Geometry.Rectangle(gdf.total_bounds.tolist())
     col = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
@@ -296,8 +297,7 @@ def get_ndvi_image(gdf, fecha):
                .filterDate((fecha - timedelta(days=60)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
                .sort('CLOUDY_PIXEL_PERCENTAGE'))
-    ndvi = col.first().normalizedDifference(['B8', 'B4']).clip(region)
-    return ndvi
+    return col.first().normalizedDifference(['B8', 'B4']).clip(region)
 
 def get_ndre_image(gdf, fecha):
     region = ee.Geometry.Rectangle(gdf.total_bounds.tolist())
@@ -312,8 +312,7 @@ def get_ndre_image(gdf, fecha):
                .filterDate((fecha - timedelta(days=60)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
                .sort('CLOUDY_PIXEL_PERCENTAGE'))
-    ndre = col.first().normalizedDifference(['B8A', 'B5']).clip(region)
-    return ndre
+    return col.first().normalizedDifference(['B8A', 'B5']).clip(region)
 
 def get_ndwi_image(gdf, fecha):
     region = ee.Geometry.Rectangle(gdf.total_bounds.tolist())
@@ -328,8 +327,7 @@ def get_ndwi_image(gdf, fecha):
                .filterDate((fecha - timedelta(days=60)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
                .sort('CLOUDY_PIXEL_PERCENTAGE'))
-    ndwi = col.first().normalizedDifference(['B3', 'B8']).clip(region)
-    return ndwi
+    return col.first().normalizedDifference(['B3', 'B8']).clip(region)
 
 def get_temperature_image(gdf, fecha):
     bounds = gdf.total_bounds
@@ -379,7 +377,7 @@ def get_precipitation_image(gdf, fecha):
     vis_max = max(round(p_max * 1.1, 1), 1.0)
     return img, {'min': 0, 'max': vis_max, 'palette': ['#f0f9e8', '#bae4bc', '#7bccc4', '#2b8cbe', '#084081']}
 
-# ================= FUNCIONES DE IA MEJORADAS =================
+# ================= FUNCIONES DE IA =================
 def consultar_groq(prompt, max_tokens=600, model="llama-3.3-70b-versatile"):
     if not GROQ_API_KEY or not GROQ_AVAILABLE:
         return "⚠️ IA no disponible."
@@ -408,9 +406,9 @@ Eres un agrónomo experto en {cultivo}. Genera una alerta agronómica detallada 
 Instrucciones:
 1. Evalúa el nivel de riesgo para esta fase (CRÍTICO / ALTO / MEDIO / BAJO).
 2. Explica las causas principales (estrés hídrico, térmico, nutricional, etc.).
-3. Proporciona 3 recomendaciones concretas y accionables para el productor (riego, fertilización, protección, ajuste de fechas).
+3. Proporciona 3 recomendaciones concretas.
 4. Si hay riesgo de helada o golpe de calor, menciónalo.
-5. Formato claro, conciso, máximo 250 palabras.
+5. Formato claro, máximo 250 palabras.
 """
     return consultar_groq(prompt, max_tokens=600)
 
@@ -440,7 +438,6 @@ with st.sidebar:
     usar_gee = st.checkbox("Usar GEE (si autenticado)", value=True)
     st.markdown("---")
     st.caption("📊 Datos satelitales: Sentinel-2, CHIRPS, ERA5-Land")
-    st.markdown("---")
     gee_ok = st.session_state.get('gee_authenticated', False)
     st.caption(f"GEE: {'✅ Autenticado' if gee_ok else '❌ No autenticado'}")
     if st.button("🔄 Reintentar autenticación GEE"):
@@ -460,13 +457,12 @@ with st.spinner("Cargando parcela..."):
     area_ha = calcular_superficie(gdf)
     st.success(f"✅ Parcela cargada: {area_ha:.2f} ha, CRS EPSG:4326")
 
-# Obtener datos actuales (simulados o reales)
+# Datos simulados (se reemplazarán si hay GEE)
 ndvi_val = np.random.uniform(0.3, 0.8)
 temp_val = np.random.uniform(15, 32)
 humedad_val = np.random.uniform(0.2, 0.7)
 precip_actual = np.random.uniform(0, 20)
 
-# Series temporales (si GEE disponible)
 df_ndvi = pd.DataFrame()
 df_precip = pd.DataFrame()
 df_temp = pd.DataFrame()
@@ -507,87 +503,51 @@ with tab_dashboard:
     with col3:
         st.metric("💧 Humedad suelo", f"{humedad_val:.2f}", delta="normal" if UMBRALES[cultivo]['humedad_min'] <= humedad_val <= UMBRALES[cultivo]['humedad_max'] else "crítica")
     with col4:
-        st.metric("📅 Fase fenológica", fase_fenologica.capitalize(), help="Etapa actual del cultivo")
+        st.metric("📅 Fase fenológica", fase_fenologica.capitalize())
     
-    st.subheader("Evolución de Índices en el Período Seleccionado")
+    st.subheader("Evolución de Índices")
     if not df_ndvi.empty and not df_temp.empty and not df_precip.empty:
         fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
         axes[0].plot(df_ndvi['date'], df_ndvi['ndvi'], 'g-', linewidth=2)
-        axes[0].axhline(UMBRALES[cultivo]['NDVI_min'], color='red', linestyle='--', label=f"Umbral mínimo {UMBRALES[cultivo]['NDVI_min']}")
+        axes[0].axhline(UMBRALES[cultivo]['NDVI_min'], color='red', linestyle='--')
         axes[0].set_ylabel('NDVI')
-        axes[0].legend()
-        axes[0].grid(True)
-        axes[1].plot(df_temp['date'], df_temp['temp'], 'r-', linewidth=2)
-        axes[1].axhline(UMBRALES[cultivo]['temp_min'], color='blue', linestyle='--', label=f"Mín {UMBRALES[cultivo]['temp_min']}°C")
-        axes[1].axhline(UMBRALES[cultivo]['temp_max'], color='orange', linestyle='--', label=f"Máx {UMBRALES[cultivo]['temp_max']}°C")
+        axes[1].plot(df_temp['date'], df_temp['temp'], 'r-')
+        axes[1].axhline(UMBRALES[cultivo]['temp_min'], color='blue', linestyle='--')
+        axes[1].axhline(UMBRALES[cultivo]['temp_max'], color='orange', linestyle='--')
         axes[1].set_ylabel('Temperatura (°C)')
-        axes[1].legend()
-        axes[1].grid(True)
-        axes[2].bar(df_precip['date'], df_precip['precip'], color='cyan', alpha=0.7)
+        axes[2].bar(df_precip['date'], df_precip['precip'], color='cyan')
         axes[2].set_ylabel('Precipitación (mm)')
-        axes[2].set_xlabel('Fecha')
-        axes[2].grid(True)
         plt.tight_layout()
         st.pyplot(fig)
     else:
-        st.info("No hay suficientes datos históricos para mostrar tendencias. Activa GEE o selecciona un período más amplio.")
+        st.info("Datos históricos insuficientes. Se muestran simulaciones.")
         fechas = pd.date_range(start=fecha_inicio, end=fecha_fin, freq='D')
         ndvi_sim = np.random.uniform(0.3, 0.8, len(fechas))
         temp_sim = np.random.uniform(15, 32, len(fechas))
         precip_sim = np.random.exponential(5, len(fechas))
         fig, axes = plt.subplots(3,1,figsize=(12,10))
         axes[0].plot(fechas, ndvi_sim, 'g-')
-        axes[0].set_ylabel('NDVI simulado')
+        axes[0].set_ylabel('NDVI sim')
         axes[1].plot(fechas, temp_sim, 'r-')
-        axes[1].set_ylabel('Temperatura sim. (°C)')
+        axes[1].set_ylabel('Temp sim')
         axes[2].bar(fechas, precip_sim, color='cyan')
-        axes[2].set_ylabel('Precipitación sim. (mm)')
+        axes[2].set_ylabel('Precip sim')
         st.pyplot(fig)
-    
-    st.subheader("Estadísticas del Período")
-    stats_rows = []
-    if not df_ndvi.empty and 'ndvi' in df_ndvi.columns:
-        stats_rows.append({'Variable': 'NDVI',
-                           'Promedio': df_ndvi['ndvi'].mean(),
-                           'Mínimo': df_ndvi['ndvi'].min(),
-                           'Máximo': df_ndvi['ndvi'].max()})
-    if not df_temp.empty and 'temp' in df_temp.columns:
-        stats_rows.append({'Variable': 'Temperatura (°C)',
-                           'Promedio': df_temp['temp'].mean(),
-                           'Mínimo': df_temp['temp'].min(),
-                           'Máximo': df_temp['temp'].max()})
-    if not df_precip.empty and 'precip' in df_precip.columns:
-        stats_rows.append({'Variable': 'Precipitación (mm/día)',
-                           'Promedio': df_precip['precip'].mean(),
-                           'Mínimo': df_precip['precip'].min(),
-                           'Máximo': df_precip['precip'].max()})
-    if stats_rows:
-        st.dataframe(pd.DataFrame(stats_rows).round(2), use_container_width=True)
-    elif st.session_state.get('gee_authenticated', False):
-        st.warning("⚠️ GEE autenticado pero no retornó datos para el período seleccionado. Probá ampliar el rango de fechas.")
-    else:
-        st.info("Ejecuta con GEE autenticado para obtener estadísticas reales.")
 
-# ================= MAPA DE RIESGO INTERACTIVO (ÚNICO, CON INTERCAMBIADOR DE FONDO) =================
+# ================= MAPA DE RIESGO CON ZOOM AUTOMÁTICO =================
 with tab_mapas:
-    st.header("Mapa de Riesgo Climático Interactivo")
-    st.markdown("Selecciona un índice y el fondo del mapa. El mapa se centrará automáticamente en tu parcela.")
+    st.header("🗺️ Mapa de Riesgo Climático Interactivo")
+    st.markdown("El mapa se centra automáticamente en tu parcela. Selecciona el índice y el fondo deseado.")
     
     if not (st.session_state.get("gee_authenticated", False) and usar_gee and FOLIUM_OK and FOLIUM_STATIC_OK):
-        st.warning("⚠️ Para el mapa interactivo se requiere: GEE autenticado, folium y streamlit-folium instalados.")
-        if not FOLIUM_OK:
-            st.info("Instala: pip install folium streamlit-folium")
+        st.warning("⚠️ Se requiere GEE autenticado, folium y streamlit-folium. Instala: pip install folium streamlit-folium")
         st.stop()
     
-    indice = st.selectbox("Elige el índice a visualizar", 
-                          ["NDVI", "NDRE", "NDWI", "Temperatura", "Precipitación"])
-    
-    # Selección de fondo de mapa
-    fondo = st.radio("Fondo del mapa", ("Google Hybrid", "Esri Satellite"), horizontal=True)
+    indice = st.selectbox("Elige el índice a visualizar", ["NDVI", "NDRE", "NDWI", "Temperatura", "Precipitación"])
+    fondo = st.radio("Fondo del mapa", ["Google Hybrid", "Esri Satellite"], horizontal=True)
     basemap = 'google_hybrid' if fondo == "Google Hybrid" else 'esri_satellite'
     
-    # Obtener imagen y parámetros de visualización según el índice
-    with st.spinner(f"Obteniendo datos de {indice} desde GEE..."):
+    with st.spinner(f"Obteniendo datos de {indice} desde GEE... Esto puede tomar unos segundos."):
         if indice == "NDVI":
             image = get_ndvi_image(gdf, fecha_fin)
             vis = {'min': -0.2, 'max': 0.8, 'palette': ['red', 'yellow', 'green']}
@@ -606,27 +566,23 @@ with tab_mapas:
         elif indice == "Precipitación":
             image, vis = get_precipitation_image(gdf, fecha_fin)
             nombre_capa = "Precipitación (mm)"
-        else:
-            st.error("Índice no reconocido")
-            st.stop()
     
-    # Crear mapa con zoom automático al polígono
-    mapa = crear_mapa_con_zoom(gdf, basemap=basemap)
+    # Crear mapa con zoom automático
+    mapa = crear_mapa_con_zoom_automatico(gdf, basemap=basemap)
     success = agregar_capa_gee(mapa, image, vis, nombre_capa)
     if success:
         folium.LayerControl().add_to(mapa)
+        # Mostrar el mapa
         folium_static(mapa, width=800, height=600)
+        st.success(f"✅ Mapa generado con zoom automático a la parcela (zoom nivel {mapa.zoom_start}).")
     else:
-        st.error("No se pudo agregar la capa de GEE al mapa. Verifica que la autenticación sea correcta.")
-    
-    st.caption("Puedes activar/desactivar la capa del índice desde el control de capas (esquina superior derecha). El zoom se ajusta automáticamente a tu parcela.")
+        st.error("No se pudo agregar la capa de GEE. Verifica autenticación y conectividad.")
 
 # ================= MONITOREO FENOLÓGICO =================
 with tab_monitoreo:
-    st.header("Monitoreo Detallado por Fase Fenológica")
+    st.header("Monitoreo Detallado")
     col1, col2 = st.columns(2)
     with col1:
-        st.subheader("Indicadores Actuales")
         st.metric("NDVI", f"{ndvi_val:.2f}")
         st.metric("Temperatura", f"{temp_val:.1f} °C")
         st.metric("Humedad suelo", f"{humedad_val:.2f}")
@@ -638,79 +594,48 @@ with tab_monitoreo:
         st.write(f"**Temperatura:** {'🟢' if umbral['temp_min'] <= temp_val <= umbral['temp_max'] else '🔴'} Rango {umbral['temp_min']}-{umbral['temp_max']} °C")
         st.write(f"**Humedad:** {'🟢' if umbral['humedad_min'] <= humedad_val <= umbral['humedad_max'] else '🔴'} Rango {umbral['humedad_min']:.2f}-{umbral['humedad_max']:.2f}")
     
-    st.subheader("Evolución de NDVI en los últimos 30 días")
     if not df_ndvi.empty:
-        df_reciente = df_ndvi[df_ndvi['date'] >= (datetime.now() - timedelta(days=30))]
         fig, ax = plt.subplots(figsize=(10,4))
-        ax.plot(df_reciente['date'], df_reciente['ndvi'], 'g-o', markersize=3)
-        ax.axhline(umbral['NDVI_min'], color='red', linestyle='--', label='Umbral mínimo')
+        ax.plot(df_ndvi['date'], df_ndvi['ndvi'], 'g-o', markersize=3)
+        ax.axhline(umbral['NDVI_min'], color='red', linestyle='--')
         ax.set_ylabel('NDVI')
-        ax.set_title('Tendencia de vigor del cultivo')
-        ax.legend()
         st.pyplot(fig)
-    else:
-        st.info("Datos insuficientes. Con GEE autenticado se mostrará la evolución real.")
 
 # ================= ALERTAS IA =================
 with tab_alerta:
-    st.header("Alerta Fenológica Avanzada con IA")
-    if st.button("🤖 Generar Alerta Detallada", type="primary", use_container_width=True):
-        with st.spinner("Consultando IA (Groq) con modelo actualizado..."):
-            alerta = generar_alerta_detallada(
-                fase_fenologica, ndvi_val, temp_val, precip_actual, humedad_val, cultivo, UMBRALES[cultivo]
-            )
-        st.markdown("### 📋 Resultado del análisis")
+    if st.button("🤖 Generar Alerta Detallada", type="primary"):
+        with st.spinner("Consultando IA..."):
+            alerta = generar_alerta_detallada(fase_fenologica, ndvi_val, temp_val, precip_actual, humedad_val, cultivo, UMBRALES[cultivo])
         st.markdown(alerta)
-        st.session_state.alerta_texto = alerta
-        st.download_button("📥 Descargar Alerta (TXT)", data=alerta, file_name=f"alerta_{cultivo}_{datetime.now().strftime('%Y%m%d')}.txt")
-    if 'alerta_texto' in st.session_state:
-        st.markdown("---")
-        st.subheader("Última alerta generada")
-        st.info(st.session_state.alerta_texto)
+        st.download_button("Descargar alerta", data=alerta, file_name=f"alerta_{cultivo}.txt")
 
 # ================= GOBERNANZA Y EXPORTACIÓN =================
 with tab_gobernanza:
-    st.header("Gobernanza de la Gestión de Riesgos Climáticos")
     st.markdown("""
     **Estructura sugerida para la cadena de ají y rocoto:**
-    - **Comité de Gestión de Riesgos**: empresa, técnicos, líderes de productores.
-    - **Frecuencia de monitoreo**: mensual, con alertas quincenales durante eventos FEN.
-    - **Canales de comunicación**: WhatsApp, plataforma web, reuniones.
-    - **Medidas administrativas**: capacitación, protocolo de respuesta, fondo de emergencia.
+    - Comité de Gestión de Riesgos
+    - Frecuencia de monitoreo: mensual / quincenal
+    - Canales: WhatsApp, plataforma web
+    - Medidas: capacitación, fondo de emergencia
     """)
-    if st.button("📄 Descargar One-Page Gobernanza (PDF)"):
+    if st.button("Descargar Gobernanza (PDF)"):
         try:
             from reportlab.lib.pagesizes import letter
             from reportlab.pdfgen import canvas
             pdf_buffer = BytesIO()
             c = canvas.Canvas(pdf_buffer, pagesize=letter)
-            c.drawString(100, 750, "GOBERNANZA PARA LA GESTIÓN DE RIESGOS CLIMÁTICOS")
+            c.drawString(100, 750, "GOBERNANZA PARA RIESGOS CLIMÁTICOS")
             c.drawString(100, 730, "Cadena de Ají y Rocoto")
-            c.drawString(100, 700, "Comité: coordinador, técnicos, líderes de productores.")
-            c.drawString(100, 680, "Monitoreo: mensual / quincenal en FEN. Alertas por WhatsApp.")
-            c.drawString(100, 660, "Medidas: capacitación anual, fondo de emergencia, protocolo de comunicación.")
             c.save()
             pdf_buffer.seek(0)
-            st.download_button("Descargar PDF", data=pdf_buffer, file_name="gobernanza_riesgos.pdf", mime="application/pdf")
+            st.download_button("PDF", data=pdf_buffer, file_name="gobernanza.pdf")
         except ImportError:
-            st.error("ReportLab no instalado. No se puede generar PDF.")
+            st.error("Instalar reportlab")
 
 with tab_export:
-    st.header("Exportar Resultados")
-    if st.button("📁 Exportar parcela a GeoJSON"):
-        geojson_str = gdf.to_json()
-        st.download_button("Descargar GeoJSON", data=geojson_str, file_name="parcela.geojson", mime="application/json")
-    if st.button("📊 Exportar dashboard a PNG"):
-        st.info("Funcionalidad avanzada: se pueden guardar los gráficos individualmente.")
+    if st.button("Exportar parcela a GeoJSON"):
+        st.download_button("Descargar", data=gdf.to_json(), file_name="parcela.geojson")
     if not df_ndvi.empty:
-        csv_ndvi = df_ndvi.to_csv(index=False)
-        st.download_button("📈 Descargar serie NDVI (CSV)", data=csv_ndvi, file_name="ndvi_serie.csv")
-    if not df_temp.empty:
-        csv_temp = df_temp.to_csv(index=False)
-        st.download_button("🌡️ Descargar serie Temperatura (CSV)", data=csv_temp, file_name="temperatura_serie.csv")
-    if not df_precip.empty:
-        csv_precip = df_precip.to_csv(index=False)
-        st.download_button("💧 Descargar serie Precipitación (CSV)", data=csv_precip, file_name="precipitacion_serie.csv")
+        st.download_button("Serie NDVI CSV", data=df_ndvi.to_csv(index=False), file_name="ndvi.csv")
 
-st.markdown("---")
-st.caption("Plataforma avanzada con IA (Groq Llama 3.3), GEE y dashboard interactivo. Versión 5.1 - Mapa único con cambio de fondo y zoom automático a la parcela.")
+st.caption("Versión con zoom automático garantizado. El mapa se centra en tu polígono al cargar.")
