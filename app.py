@@ -1,6 +1,5 @@
 # app.py - Plataforma de Gestión de Riesgos Climáticos para Ají y Rocoto
-# Versión con mapa único, cambio de fondo (Google Hybrid / Esri Satellite),
-# ZOOM AUTOMÁTICO CON MARGEN y LEYENDA EXPLICATIVA para cada índice.
+# Versión con mapa interactivo, panel flotante, puntos críticos y leyenda.
 
 import streamlit as st
 import geopandas as gpd
@@ -198,33 +197,18 @@ def cargar_archivo_parcela(uploaded_file):
         st.error(f"❌ Error cargando archivo: {e}")
         return None
 
-# ================= FUNCIONES PARA MAPA CON ZOOM AUTOMÁTICO (CON MARGEN) =================
+# ================= FUNCIONES PARA MAPA CON ZOOM AUTOMÁTICO Y PANEL =================
 def obtener_zoom_con_margen(bounds, margin_factor=0.2):
-    """
-    Calcula un nivel de zoom adecuado añadiendo un margen alrededor del bounding box.
-    bounds: (minx, miny, maxx, maxy)
-    margin_factor: proporción del ancho/alto a añadir como margen (0.2 = 20%).
-    Retorna (centro_lat, centro_lon, zoom).
-    """
     minx, miny, maxx, maxy = bounds
-    # Añadir margen
     dx = (maxx - minx) * margin_factor
     dy = (maxy - miny) * margin_factor
     minx -= dx
     maxx += dx
     miny -= dy
     maxy += dy
-    
     centro_lat = (miny + maxy) / 2
     centro_lon = (minx + maxx) / 2
-    
-    # Calcular zoom basado en la mayor diferencia (lat o lon)
-    lat_diff = maxy - miny
-    lon_diff = maxx - minx
-    
-    # Heurística mejorada para zoom (valores empíricos)
-    # Para un margen del 20%, se ajusta el zoom para que se vea el polígono con espacio
-    max_diff = max(lat_diff, lon_diff)
+    max_diff = max(maxy - miny, maxx - minx)
     if max_diff > 10:
         zoom = 6
     elif max_diff > 5:
@@ -249,51 +233,8 @@ def obtener_zoom_con_margen(bounds, margin_factor=0.2):
         zoom = 16
     else:
         zoom = 17
-    
-    # Limitar rango de zoom (evitar demasiado zoom o muy alejado)
     zoom = max(6, min(17, zoom))
     return centro_lat, centro_lon, zoom
-
-def crear_mapa_con_zoom_margen(gdf, basemap='google_hybrid', margin_factor=0.2):
-    """
-    Crea un mapa Folium centrado en el polígono con margen y zoom automático.
-    """
-    bounds = gdf.total_bounds
-    centro_lat, centro_lon, zoom = obtener_zoom_con_margen(bounds, margin_factor)
-    
-    m = folium.Map(location=[centro_lat, centro_lon], zoom_start=zoom, control_scale=True)
-    
-    # Añadir el polígono de la parcela
-    folium.GeoJson(
-        gdf.__geo_interface__,
-        name='Parcela',
-        style_function=lambda x: {'color': 'yellow', 'weight': 3, 'fillOpacity': 0.1}
-    ).add_to(m)
-    
-    # Configurar el basemap
-    if basemap == 'google_hybrid':
-        folium.TileLayer(
-            tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
-            attr='Google',
-            name='Google Hybrid',
-            overlay=False,
-            control=True
-        ).add_to(m)
-    elif basemap == 'esri_satellite':
-        folium.TileLayer(
-            tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-            attr='Esri',
-            name='Esri Satellite',
-            overlay=False,
-            control=True
-        ).add_to(m)
-    else:
-        folium.TileLayer('openstreetmap', name='OSM').add_to(m)
-    
-    # Añadir control de pantalla completa
-    Fullscreen().add_to(m)
-    
-    return m
 
 def obtener_tile_url_gee(image, vis_params):
     try:
@@ -303,20 +244,7 @@ def obtener_tile_url_gee(image, vis_params):
         st.warning(f"Error generando tile URL: {e}")
         return None
 
-def agregar_capa_gee(m, image, vis_params, nombre_capa):
-    tile_url = obtener_tile_url_gee(image, vis_params)
-    if tile_url:
-        folium.TileLayer(
-            tiles=tile_url,
-            attr='Google Earth Engine',
-            name=nombre_capa,
-            overlay=True,
-            control=True
-        ).add_to(m)
-        return True
-    return False
-
-# Funciones para obtener imágenes EE (igual que antes)
+# Funciones para obtener imágenes EE y estadísticas
 def get_ndvi_image(gdf, fecha):
     region = ee.Geometry.Rectangle(gdf.total_bounds.tolist())
     col = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
@@ -330,7 +258,8 @@ def get_ndvi_image(gdf, fecha):
                .filterDate((fecha - timedelta(days=60)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
                .sort('CLOUDY_PIXEL_PERCENTAGE'))
-    return col.first().normalizedDifference(['B8', 'B4']).clip(region)
+    ndvi = col.first().normalizedDifference(['B8', 'B4']).clip(region)
+    return ndvi
 
 def get_ndre_image(gdf, fecha):
     region = ee.Geometry.Rectangle(gdf.total_bounds.tolist())
@@ -345,7 +274,8 @@ def get_ndre_image(gdf, fecha):
                .filterDate((fecha - timedelta(days=60)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
                .sort('CLOUDY_PIXEL_PERCENTAGE'))
-    return col.first().normalizedDifference(['B8A', 'B5']).clip(region)
+    ndre = col.first().normalizedDifference(['B8A', 'B5']).clip(region)
+    return ndre
 
 def get_ndwi_image(gdf, fecha):
     region = ee.Geometry.Rectangle(gdf.total_bounds.tolist())
@@ -360,7 +290,8 @@ def get_ndwi_image(gdf, fecha):
                .filterDate((fecha - timedelta(days=60)).strftime('%Y-%m-%d'), fecha.strftime('%Y-%m-%d'))
                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
                .sort('CLOUDY_PIXEL_PERCENTAGE'))
-    return col.first().normalizedDifference(['B3', 'B8']).clip(region)
+    ndwi = col.first().normalizedDifference(['B3', 'B8']).clip(region)
+    return ndwi
 
 def get_temperature_image(gdf, fecha):
     bounds = gdf.total_bounds
@@ -410,49 +341,57 @@ def get_precipitation_image(gdf, fecha):
     vis_max = max(round(p_max * 1.1, 1), 1.0)
     return img, {'min': 0, 'max': vis_max, 'palette': ['#f0f9e8', '#bae4bc', '#7bccc4', '#2b8cbe', '#084081']}
 
-# ================= FUNCIONES PARA LEYENDA =================
-def mostrar_leyenda(indice):
-    """Muestra una leyenda explicativa usando matplotlib."""
-    fig, ax = plt.subplots(figsize=(6, 1.5))
-    ax.axis('off')
-    if indice == "NDVI":
-        cmap = LinearSegmentedColormap.from_list('ndvi', ['red', 'yellow', 'green'])
-        norm = plt.Normalize(-0.2, 0.8)
-        sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
-        cbar = plt.colorbar(sm, cax=ax, orientation='horizontal')
-        cbar.set_label('NDVI', fontsize=10)
-        ax.set_title('Valores bajos (rojo) = poca vegetación; altos (verde) = vegetación vigorosa', fontsize=8)
-    elif indice == "NDRE":
-        cmap = LinearSegmentedColormap.from_list('ndre', ['red', 'yellow', 'green'])
-        norm = plt.Normalize(-0.2, 0.8)
-        sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
-        cbar = plt.colorbar(sm, cax=ax, orientation='horizontal')
-        cbar.set_label('NDRE', fontsize=10)
-        ax.set_title('Contenido de clorofila (similar a NDVI para cultivos)', fontsize=8)
-    elif indice == "NDWI":
-        cmap = LinearSegmentedColormap.from_list('ndwi', ['brown', 'white', 'blue'])
-        norm = plt.Normalize(-0.5, 0.5)
-        sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
-        cbar = plt.colorbar(sm, cax=ax, orientation='horizontal')
-        cbar.set_label('NDWI', fontsize=10)
-        ax.set_title('Valores negativos (marrón) = suelo seco; positivos (azul) = agua/vegetación húmeda', fontsize=8)
-    elif indice == "Temperatura":
-        palette = ['#313695','#4575b4','#74add1','#abd9e9','#e0f3f8','#ffffbf','#fee090','#fdae61','#f46d43','#d73027','#a50026']
-        cmap = LinearSegmentedColormap.from_list('temp', palette)
-        norm = plt.Normalize(5, 35)  # rango aproximado
-        sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
-        cbar = plt.colorbar(sm, cax=ax, orientation='horizontal')
-        cbar.set_label('Temperatura (°C)', fontsize=10)
-        ax.set_title('Colores fríos (azul) = temperaturas bajas; cálidos (rojo) = altas temperaturas', fontsize=8)
-    elif indice == "Precipitación":
-        palette = ['#f0f9e8', '#bae4bc', '#7bccc4', '#2b8cbe', '#084081']
-        cmap = LinearSegmentedColormap.from_list('precip', palette)
-        norm = plt.Normalize(0, 50)  # rango de ejemplo
-        sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
-        cbar = plt.colorbar(sm, cax=ax, orientation='horizontal')
-        cbar.set_label('Precipitación (mm)', fontsize=10)
-        ax.set_title('Verde claro = poca lluvia; azul oscuro = mucha lluvia', fontsize=8)
-    st.pyplot(fig)
+# Funciones para obtener estadísticas y puntos críticos
+def get_mean_value(image, polygon_geom):
+    """Calcula el valor medio de la imagen dentro del polígono."""
+    mean_dict = image.reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=polygon_geom,
+        scale=10,  # resolución de Sentinel-2
+        maxPixels=1e9
+    ).getInfo()
+    band_names = image.bandNames().getInfo()
+    if band_names:
+        return mean_dict.get(band_names[0], None)
+    return None
+
+def get_critical_points(image, polygon_geom, threshold, num_points=20):
+    """
+    Retorna una lista de coordenadas (lon, lat) de puntos dentro del polígono
+    donde el valor de la imagen es < umbral (puntos críticos).
+    """
+    # Crear una máscara binaria (1 donde valor < threshold, 0 en caso contrario)
+    mask = image.lt(threshold)
+    # Aplicar máscara y obtener coordenadas
+    points = image.updateMask(mask).sample(
+        region=polygon_geom,
+        scale=10,
+        numPixels=num_points,
+        geometries=True
+    )
+    coords = []
+    try:
+        features = points.getInfo().get('features', [])
+        for f in features:
+            geom = f.get('geometry')
+            if geom and geom.get('type') == 'Point':
+                coords.append((geom['coordinates'][0], geom['coordinates'][1]))
+    except Exception as e:
+        st.warning(f"No se pudieron obtener puntos críticos: {e}")
+    return coords
+
+def determinar_riesgo(indice, valor, cultivo, umbrales):
+    """Determina nivel de riesgo basado en el valor del índice y umbrales del cultivo."""
+    if indice in ["NDVI", "NDRE"]:
+        umbral = umbrales.get('NDVI_min', 0.4)
+        if valor >= umbral:
+            return "BAJO", "🟢"
+        elif valor >= umbral * 0.7:
+            return "MEDIO", "🟡"
+        else:
+            return "CRÍTICO", "🔴"
+    else:
+        return "BAJO", "🟢"
 
 # ================= FUNCIONES DE IA =================
 def consultar_groq(prompt, max_tokens=600, model="llama-3.3-70b-versatile"):
@@ -611,10 +550,10 @@ with tab_dashboard:
         axes[2].set_ylabel('Precip sim')
         st.pyplot(fig)
 
-# ================= MAPA DE RIESGO CON ZOOM AJUSTADO Y LEYENDA =================
+# ================= MAPA DE RIESGO CON PANEL FLOTANTE Y PUNTOS CRÍTICOS =================
 with tab_mapas:
     st.header("🗺️ Mapa de Riesgo Climático Interactivo")
-    st.markdown("El mapa se centra automáticamente en tu parcela con un margen del 20% alrededor para una mejor visualización.")
+    st.markdown("El mapa muestra el índice seleccionado, puntos críticos (valores bajos) y un panel informativo.")
     
     if not (st.session_state.get("gee_authenticated", False) and usar_gee and FOLIUM_OK and FOLIUM_STATIC_OK):
         st.warning("⚠️ Se requiere GEE autenticado, folium y streamlit-folium. Instala: pip install folium streamlit-folium")
@@ -624,39 +563,175 @@ with tab_mapas:
     fondo = st.radio("Fondo del mapa", ["Google Hybrid", "Esri Satellite"], horizontal=True)
     basemap = 'google_hybrid' if fondo == "Google Hybrid" else 'esri_satellite'
     
-    with st.spinner(f"Obteniendo datos de {indice} desde GEE... Esto puede tomar unos segundos."):
+    with st.spinner(f"Obteniendo datos de {indice} y calculando estadísticas... Esto puede tomar hasta 30 segundos."):
+        # Obtener la imagen y parámetros de visualización
         if indice == "NDVI":
             image = get_ndvi_image(gdf, fecha_fin)
             vis = {'min': -0.2, 'max': 0.8, 'palette': ['red', 'yellow', 'green']}
             nombre_capa = "NDVI"
+            umbral_critico = 0.2  # por debajo de 0.2 se considera punto crítico
         elif indice == "NDRE":
             image = get_ndre_image(gdf, fecha_fin)
             vis = {'min': -0.2, 'max': 0.8, 'palette': ['red', 'yellow', 'green']}
             nombre_capa = "NDRE"
+            umbral_critico = 0.2
         elif indice == "NDWI":
             image = get_ndwi_image(gdf, fecha_fin)
             vis = {'min': -0.5, 'max': 0.5, 'palette': ['brown', 'white', 'blue']}
             nombre_capa = "NDWI"
+            umbral_critico = -0.2  # valores muy negativos indican sequía
         elif indice == "Temperatura":
             image, vis = get_temperature_image(gdf, fecha_fin)
             nombre_capa = "Temperatura (°C)"
+            # Para temperatura, consideramos crítico si es <10 o >35
+            umbral_critico = None  # no aplica para puntos
         elif indice == "Precipitación":
             image, vis = get_precipitation_image(gdf, fecha_fin)
             nombre_capa = "Precipitación (mm)"
-    
-    # Crear mapa con zoom automático y margen del 20%
-    mapa = crear_mapa_con_zoom_margen(gdf, basemap, margin_factor=0.2)
-    success = agregar_capa_gee(mapa, image, vis, nombre_capa)
-    if success:
-        folium.LayerControl().add_to(mapa)
-        folium_static(mapa, width=800, height=600)
-        st.success("✅ Mapa generado con zoom ajustado (margen del 20%).")
+            umbral_critico = 1.0  # menos de 1 mm es seco
         
-        # Mostrar leyenda explicativa
-        st.markdown("### 📖 Leyenda del mapa")
-        mostrar_leyenda(indice)
-    else:
-        st.error("No se pudo agregar la capa de GEE. Verifica autenticación y conectividad.")
+        # Convertir el GeoDataFrame a Geometry de EE
+        polygon_geom = ee.Geometry.Polygon(gdf.geometry.iloc[0].__geo_interface__['coordinates'][0])
+        
+        # Calcular valor medio
+        mean_val = get_mean_value(image, polygon_geom)
+        if mean_val is None:
+            mean_val = 0.0
+        st.info(f"📊 Valor medio de {indice} en la parcela: {mean_val:.3f}")
+        
+        # Determinar riesgo
+        riesgo, emoji = determinar_riesgo(indice, mean_val, cultivo, UMBRALES[cultivo])
+        
+        # Obtener puntos críticos (si aplica)
+        critical_coords = []
+        if umbral_critico is not None:
+            critical_coords = get_critical_points(image, polygon_geom, umbral_critico, num_points=20)
+        num_criticos = len(critical_coords)
+        
+        # Construir mapa con zoom automático
+        bounds = gdf.total_bounds
+        centro_lat, centro_lon, zoom = obtener_zoom_con_margen(bounds, margin_factor=0.2)
+        mapa = folium.Map(location=[centro_lat, centro_lon], zoom_start=zoom, control_scale=True)
+        
+        # Añadir polígono de la parcela
+        folium.GeoJson(
+            gdf.__geo_interface__,
+            name='Parcela',
+            style_function=lambda x: {'color': 'yellow', 'weight': 3, 'fillOpacity': 0.05}
+        ).add_to(mapa)
+        
+        # Añadir puntos críticos (círculos rojos)
+        for lon, lat in critical_coords:
+            folium.CircleMarker(
+                location=[lat, lon],
+                radius=6,
+                color='red',
+                weight=3,
+                fill=True,
+                fill_color='white',
+                fill_opacity=0.2,
+                popup=f"⚠️ Punto crítico<br>{indice}: valor bajo<br>Lat: {lat:.5f}<br>Lon: {lon:.5f}",
+                tooltip=f"Punto crítico {indice}"
+            ).add_to(mapa)
+        
+        # Añadir marcador central con etiqueta
+        center_lat = gdf.geometry.centroid.y.iloc[0]
+        center_lon = gdf.geometry.centroid.x.iloc[0]
+        html_label = f"""
+        <div style="background:white; border:2px solid #2ca02c; border-radius:6px; padding:3px 8px; font-size:11px; font-weight:bold; box-shadow:2px 2px 4px rgba(0,0,0,0.3); white-space:nowrap;">
+            {emoji} {cultivo}<br>
+            <span style="font-size:10px; color:#555;">{indice} {mean_val:.2f} ({riesgo})</span>
+        </div>
+        """
+        folium.Marker(
+            location=[center_lat, center_lon],
+            icon=folium.DivIcon(html=html_label, icon_size=(160, 35), icon_anchor=(80, 17))
+        ).add_to(mapa)
+        
+        # Añadir capa de GEE
+        tile_url = obtener_tile_url_gee(image, vis)
+        if tile_url:
+            folium.TileLayer(
+                tiles=tile_url,
+                attr='Google Earth Engine',
+                name=f"{indice} (GEE)",
+                overlay=True,
+                control=True
+            ).add_to(mapa)
+        
+        # Añadir selección de fondo de mapa
+        if basemap == 'google_hybrid':
+            folium.TileLayer(
+                tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
+                attr='Google',
+                name='Google Hybrid',
+                overlay=False,
+                control=True
+            ).add_to(mapa)
+        else:
+            folium.TileLayer(
+                tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+                attr='Esri',
+                name='Esri Satellite',
+                overlay=False,
+                control=True
+            ).add_to(mapa)
+        
+        # Panel flotante (Dashboard de Decisión) - similar al ejemplo
+        panel_html = f"""
+        <div style="position: fixed; bottom: 30px; left: 30px; z-index: 1000;
+                    background: white; padding: 12px 16px; border-radius: 8px;
+                    border: 1px solid #ccc; box-shadow: 2px 2px 8px rgba(0,0,0,0.2);
+                    font-family: Arial; font-size: 12px; min-width: 200px;">
+            <b style="font-size:13px;">🌶️ Dashboard de Decisión</b>
+            <hr style="margin:6px 0;">
+            <b>{cultivo}:</b><br>
+            {emoji} Riesgo: <b>{riesgo}</b><br>
+            {indice} Medio: <b>{mean_val:.3f}</b>
+            <hr style="margin:6px 0;">
+            <b>Puntos Críticos:</b> {num_criticos}<br>
+            <span style="font-size:10px; color:#888;">Umbral {"<"+str(umbral_critico) if umbral_critico else "N/A"}</span>
+            <hr style="margin:6px 0;">
+            <b>Leyenda {indice}:</b><br>
+        """
+        # Añadir leyenda de colores según el índice
+        if indice in ["NDVI", "NDRE"]:
+            panel_html += """
+            <span style="color:#d73027;">■</span> Muy bajo (<0.2)<br>
+            <span style="color:#f1c40f;">■</span> Bajo (0.2-0.4)<br>
+            <span style="color:#2ecc71;">■</span> Óptimo (>0.4)
+            """
+        elif indice == "NDWI":
+            panel_html += """
+            <span style="color:#8B4513;">■</span> Seco (< -0.2)<br>
+            <span style="color:#white;">■</span> Normal (-0.2 a 0.2)<br>
+            <span style="color:#0000FF;">■</span> Húmedo (>0.2)
+            """
+        elif indice == "Temperatura":
+            panel_html += """
+            <span style="color:#313695;">■</span> Frío (<15°C)<br>
+            <span style="color:#ffffbf;">■</span> Óptimo (15-28°C)<br>
+            <span style="color:#d73027;">■</span> Calor (>28°C)
+            """
+        elif indice == "Precipitación":
+            panel_html += """
+            <span style="color:#f0f9e8;">■</span> Seco (<5 mm)<br>
+            <span style="color:#7bccc4;">■</span> Moderado (5-20 mm)<br>
+            <span style="color:#084081;">■</span> Lluvioso (>20 mm)
+            """
+        panel_html += '<hr style="margin:6px 0;"><span style="font-size:10px; color:#888;">Datos: Sentinel-2, ERA5, CHIRPS</span></div>'
+        
+        # Agregar el panel como un elemento HTML personalizado usando folium.Element
+        from folium import Element
+        Element(panel_html).add_to(mapa)
+        
+        # Control de capas
+        folium.LayerControl(collapsed=False).add_to(mapa)
+        Fullscreen().add_to(mapa)
+        
+        # Mostrar mapa
+        folium_static(mapa, width=900, height=650)
+        st.success(f"✅ Mapa generado con {num_criticos} puntos críticos y panel informativo.")
 
 # ================= MONITOREO FENOLÓGICO =================
 with tab_monitoreo:
@@ -718,4 +793,4 @@ with tab_export:
     if not df_ndvi.empty:
         st.download_button("Serie NDVI CSV", data=df_ndvi.to_csv(index=False), file_name="ndvi.csv")
 
-st.caption("Versión con zoom automático con margen del 20% y leyenda explicativa para cada índice.")
+st.caption("Plataforma avanzada con panel flotante, puntos críticos y leyenda integrada.")
