@@ -2,6 +2,7 @@
 # Versión con mapa interactivo, panel flotante, puntos críticos y leyenda.
 
 import streamlit as st
+import streamlit.components.v1 as components
 import geopandas as gpd
 import pandas as pd
 import numpy as np
@@ -17,6 +18,18 @@ from shapely.geometry import Polygon
 import matplotlib.patches as mpatches
 from matplotlib.colors import LinearSegmentedColormap
 
+
+# ================= AGROIA GEE =================
+try:
+    from agroia_gee import (
+        obtener_ndvi_actual, obtener_ndwi_actual, obtener_ndre_actual,
+        obtener_temperatura_actual, obtener_precipitacion_actual,
+        obtener_serie_temporal_ndvi, obtener_serie_temporal_temperatura,
+        obtener_serie_temporal_precipitacion
+    )
+    AGROIA_OK = True
+except ImportError:
+    AGROIA_OK = False
 # ================= DEPENDENCIAS OPCIONALES =================
 try:
     import folium
@@ -382,11 +395,19 @@ def get_critical_points(image, polygon_geom, threshold, num_points=20):
 
 def determinar_riesgo(indice, valor, cultivo, umbrales):
     """Determina nivel de riesgo basado en el valor del índice y umbrales del cultivo."""
-    if indice in ["NDVI", "NDRE"]:
+    if indice == "NDVI":
         umbral = umbrales.get('NDVI_min', 0.4)
         if valor >= umbral:
             return "BAJO", "🟢"
-        elif valor >= umbral * 0.7:
+        elif valor >= umbral * 0.75:
+            return "MEDIO", "🟡"
+        else:
+            return "CRÍTICO", "🔴"
+    elif indice == "NDRE":
+        umbral = umbrales.get('NDRE_min', 0.15)
+        if valor >= umbral:
+            return "BAJO", "🟢"
+        elif valor >= umbral * 0.67:
             return "MEDIO", "🟡"
         else:
             return "CRÍTICO", "🔴"
@@ -432,9 +453,9 @@ Instrucciones:
 CULTIVOS = ["AJÍ", "ROCOTO", "PAPA ANDINA"]
 ICONOS = {"AJÍ": "🌶️", "ROCOTO": "🥵", "PAPA ANDINA": "🥔"}
 UMBRALES = {
-    "AJÍ": {"NDVI_min": 0.4, "temp_min": 18, "temp_max": 30, "humedad_min": 0.25, "humedad_max": 0.65},
-    "ROCOTO": {"NDVI_min": 0.45, "temp_min": 16, "temp_max": 28, "humedad_min": 0.30, "humedad_max": 0.70},
-    "PAPA ANDINA": {"NDVI_min": 0.5, "temp_min": 10, "temp_max": 22, "humedad_min": 0.35, "humedad_max": 0.75}
+    "AJÍ": {"NDVI_min": 0.4, "NDRE_min": 0.15, "temp_min": 18, "temp_max": 30, "humedad_min": 0.25, "humedad_max": 0.65},
+    "ROCOTO": {"NDVI_min": 0.45, "NDRE_min": 0.18, "temp_min": 16, "temp_max": 28, "humedad_min": 0.30, "humedad_max": 0.70},
+    "PAPA ANDINA": {"NDVI_min": 0.5, "NDRE_min": 0.20, "temp_min": 10, "temp_max": 22, "humedad_min": 0.35, "humedad_max": 0.75}
 }
 
 # ================= INTERFAZ PRINCIPAL =================
@@ -473,35 +494,45 @@ with st.spinner("Cargando parcela..."):
     area_ha = calcular_superficie(gdf)
     st.success(f"✅ Parcela cargada: {area_ha:.2f} ha, CRS EPSG:4326")
 
-# Datos simulados (se reemplazarán si hay GEE)
-ndvi_val = np.random.uniform(0.3, 0.8)
-temp_val = np.random.uniform(15, 32)
-humedad_val = np.random.uniform(0.2, 0.7)
-precip_actual = np.random.uniform(0, 20)
+# Valores neutros por defecto (se reemplazan con datos reales si GEE está disponible)
+ndvi_val = 0.5
+ndre_val = None
+temp_val = 20.0
+humedad_val = 0.4
+precip_actual = 0.0
 
 df_ndvi = pd.DataFrame()
 df_precip = pd.DataFrame()
 df_temp = pd.DataFrame()
-if st.session_state.get("gee_authenticated", False) and usar_gee:
-    with st.spinner("Descargando series temporales desde GEE..."):
+
+if st.session_state.get("gee_authenticated", False) and AGROIA_OK:
+    with st.spinner("Obteniendo datos reales desde GEE..."):
         try:
-            from agroia_gee import (
-                obtener_serie_temporal_ndvi, obtener_serie_temporal_temperatura,
-                obtener_serie_temporal_precipitacion
-            )
-            df_ndvi = obtener_serie_temporal_ndvi(gdf, fecha_inicio.strftime('%Y-%m-%d'), fecha_fin.strftime('%Y-%m-%d'))
+            _v = obtener_ndvi_actual(gdf)
+            if _v is not None: ndvi_val = _v
+            _v = obtener_ndre_actual(gdf)
+            if _v is not None: ndre_val = _v
+            _v = obtener_temperatura_actual(gdf)
+            if _v is not None: temp_val = _v
+            _v = obtener_precipitacion_actual(gdf)
+            if _v is not None: precip_actual = _v
+            _v = obtener_ndwi_actual(gdf)
+            if _v is not None: humedad_val = _v
+        except Exception as _e:
+            st.warning(f"⚠️ Error obteniendo datos actuales: {_e}")
+
+    with st.spinner("Descargando series temporales..."):
+        try:
+            df_ndvi  = obtener_serie_temporal_ndvi(gdf, fecha_inicio.strftime('%Y-%m-%d'), fecha_fin.strftime('%Y-%m-%d'))
             df_precip = obtener_serie_temporal_precipitacion(gdf, fecha_inicio.strftime('%Y-%m-%d'), fecha_fin.strftime('%Y-%m-%d'))
-            df_temp = obtener_serie_temporal_temperatura(gdf, fecha_inicio.strftime('%Y-%m-%d'), fecha_fin.strftime('%Y-%m-%d'))
-            if not df_ndvi.empty:
-                ndvi_val = df_ndvi['ndvi'].iloc[-1]
-            if not df_temp.empty:
-                temp_val = df_temp['temp'].iloc[-1]
-            if not df_precip.empty:
-                precip_actual = df_precip['precip'].iloc[-1]
-        except ImportError:
-            st.info("Módulo agroia_gee no encontrado. Usando datos simulados.")
+            df_temp  = obtener_serie_temporal_temperatura(gdf, fecha_inicio.strftime('%Y-%m-%d'), fecha_fin.strftime('%Y-%m-%d'))
+        except Exception as _e:
+            st.warning(f"⚠️ Error en series temporales: {_e}")
 else:
-    st.info("GEE no autenticado o no seleccionado. Se usan datos simulados.")
+    if not st.session_state.get("gee_authenticated", False):
+        st.info("GEE no autenticado. Se usan valores por defecto.")
+    elif not AGROIA_OK:
+        st.info("Módulo agroia_gee no encontrado. Se usan valores por defecto.")
 
 # ================= PESTAÑAS =================
 tab_dashboard, tab_mapas, tab_monitoreo, tab_alerta, tab_gobernanza, tab_export = st.tabs(
@@ -553,185 +584,235 @@ with tab_dashboard:
 # ================= MAPA DE RIESGO CON PANEL FLOTANTE Y PUNTOS CRÍTICOS =================
 with tab_mapas:
     st.header("🗺️ Mapa de Riesgo Climático Interactivo")
-    st.markdown("El mapa muestra el índice seleccionado, puntos críticos (valores bajos) y un panel informativo.")
-    
-    if not (st.session_state.get("gee_authenticated", False) and usar_gee and FOLIUM_OK and FOLIUM_STATIC_OK):
-        st.warning("⚠️ Se requiere GEE autenticado, folium y streamlit-folium. Instala: pip install folium streamlit-folium")
+    st.markdown("Seleccioná el índice, el fondo y visualizá el mapa con la imagen satelital real, "
+                "puntos críticos georeferenciados y un panel informativo.")
+
+    if not (st.session_state.get("gee_authenticated", False) and usar_gee and FOLIUM_OK):
+        st.warning("⚠️ Se requiere GEE autenticado y folium instalado (`pip install folium`).")
         st.stop()
-    
-    indice = st.selectbox("Elige el índice a visualizar", ["NDVI", "NDRE", "NDWI", "Temperatura", "Precipitación"])
-    fondo = st.radio("Fondo del mapa", ["Google Hybrid", "Esri Satellite"], horizontal=True)
-    basemap = 'google_hybrid' if fondo == "Google Hybrid" else 'esri_satellite'
-    
-    with st.spinner(f"Obteniendo datos de {indice} y calculando estadísticas... Esto puede tomar hasta 30 segundos."):
-        # Obtener la imagen y parámetros de visualización
+
+    col_idx, col_fondo = st.columns([2, 1])
+    with col_idx:
+        indice = st.selectbox(
+            "Índice a visualizar",
+            ["NDVI", "NDRE", "NDWI", "Temperatura", "Precipitación"],
+            help="NDRE detecta estrés en clorofila antes de que el NDVI lo muestre"
+        )
+    with col_fondo:
+        fondo = st.radio("Fondo", ["Google Hybrid", "Esri Satellite"], horizontal=True)
+
+    with st.spinner(f"⏳ Generando mapa {indice} desde GEE…"):
+        # ── Imagen + parámetros de visualización ──────────────────────────────
         if indice == "NDVI":
             image = get_ndvi_image(gdf, fecha_fin)
-            vis = {'min': -0.2, 'max': 0.8, 'palette': ['red', 'yellow', 'green']}
-            nombre_capa = "NDVI"
-            umbral_critico = 0.2  # por debajo de 0.2 se considera punto crítico
+            vis = {'min': 0.0, 'max': 0.8,
+                   'palette': ['#d73027','#f46d43','#fdae61','#fee08b',
+                                '#d9ef8b','#a6d96a','#66bd63','#1a9850']}
+            umbral_critico = UMBRALES[cultivo].get('NDVI_min', 0.3)
+            leyenda = [("#d73027","Muy bajo (<0.2)"),
+                       ("#f1c40f","Bajo (0.2–0.4)"),
+                       ("#2ecc71","Óptimo (>0.4)")]
+            unidad = ""
+
         elif indice == "NDRE":
             image = get_ndre_image(gdf, fecha_fin)
-            vis = {'min': -0.2, 'max': 0.8, 'palette': ['red', 'yellow', 'green']}
-            nombre_capa = "NDRE"
-            umbral_critico = 0.2
+            vis = {'min': -0.1, 'max': 0.4,
+                   'palette': ['#d73027','#f46d43','#fdae61','#fee08b',
+                                '#d9ef8b','#a6d96a','#66bd63','#1a9850']}
+            umbral_critico = UMBRALES[cultivo].get('NDRE_min', 0.10)
+            leyenda = [("#d73027","🟥 Bajo (<0.10) — estrés nutricional temprano"),
+                       ("#f1c40f","🟨 Moderado (0.10–0.20)"),
+                       ("#2ecc71","🟩 Óptimo (>0.20)")]
+            unidad = ""
+
         elif indice == "NDWI":
             image = get_ndwi_image(gdf, fecha_fin)
-            vis = {'min': -0.5, 'max': 0.5, 'palette': ['brown', 'white', 'blue']}
-            nombre_capa = "NDWI"
-            umbral_critico = -0.2  # valores muy negativos indican sequía
+            vis = {'min': -0.5, 'max': 0.5,
+                   'palette': ['#8B4513','#d4a464','#ffffcc','#74add1','#2b8cbe']}
+            umbral_critico = -0.2
+            leyenda = [("#8B4513","Seco (<-0.2)"),
+                       ("#ffffcc","Normal (-0.2–0.2)"),
+                       ("#2b8cbe","Húmedo (>0.2)")]
+            unidad = ""
+
         elif indice == "Temperatura":
             image, vis = get_temperature_image(gdf, fecha_fin)
-            nombre_capa = "Temperatura (°C)"
-            # Para temperatura, consideramos crítico si es <10 o >35
-            umbral_critico = None  # no aplica para puntos
+            umbral_critico = None
+            leyenda = [("#313695","Frío (<15 °C)"),
+                       ("#ffffbf","Óptimo (15–28 °C)"),
+                       ("#d73027","Calor (>28 °C)")]
+            unidad = " °C"
+
         elif indice == "Precipitación":
             image, vis = get_precipitation_image(gdf, fecha_fin)
-            nombre_capa = "Precipitación (mm)"
-            umbral_critico = 1.0  # menos de 1 mm es seco
-        
-        # Convertir el GeoDataFrame a Geometry de EE
-        polygon_geom = ee.Geometry.Polygon(gdf.geometry.iloc[0].__geo_interface__['coordinates'][0])
-        
-        # Calcular valor medio
+            umbral_critico = 1.0
+            leyenda = [("#f0f9e8","Seco (<5 mm)"),
+                       ("#7bccc4","Moderado (5–20 mm)"),
+                       ("#084081","Lluvioso (>20 mm)")]
+            unidad = " mm"
+
+        # ── Geometría EE (soporta MultiPolygon) ──────────────────────────────
+        geom_raw = gdf.geometry.iloc[0]
+        if geom_raw.geom_type == 'MultiPolygon':
+            geom_raw = max(geom_raw.geoms, key=lambda p: p.area)
+        poly_coords_ee = [[c[0], c[1]] for c in geom_raw.exterior.coords]
+        polygon_geom = ee.Geometry.Polygon(poly_coords_ee)
+
+        # ── Estadísticas ──────────────────────────────────────────────────────
         mean_val = get_mean_value(image, polygon_geom)
         if mean_val is None:
             mean_val = 0.0
-        st.info(f"📊 Valor medio de {indice} en la parcela: {mean_val:.3f}")
-        
-        # Determinar riesgo
-        riesgo, emoji = determinar_riesgo(indice, mean_val, cultivo, UMBRALES[cultivo])
-        
-        # Obtener puntos críticos (si aplica)
+        riesgo, riesgo_emoji = determinar_riesgo(indice, mean_val, cultivo, UMBRALES[cultivo])
+
         critical_coords = []
         if umbral_critico is not None:
-            critical_coords = get_critical_points(image, polygon_geom, umbral_critico, num_points=20)
+            critical_coords = get_critical_points(
+                image, polygon_geom, umbral_critico, num_points=20
+            )
         num_criticos = len(critical_coords)
-        
-        # Construir mapa con zoom automático
+
+        # ── Mapa Folium ────────────────────────────────────────────────────────
         bounds = gdf.total_bounds
         centro_lat, centro_lon, zoom = obtener_zoom_con_margen(bounds, margin_factor=0.2)
-        mapa = folium.Map(location=[centro_lat, centro_lon], zoom_start=zoom, control_scale=True)
-        
-        # Añadir polígono de la parcela
-        folium.GeoJson(
-            gdf.__geo_interface__,
-            name='Parcela',
-            style_function=lambda x: {'color': 'yellow', 'weight': 3, 'fillOpacity': 0.05}
+        mapa = folium.Map(
+            location=[centro_lat, centro_lon],
+            zoom_start=zoom,
+            control_scale=True,
+            tiles=None
+        )
+
+        # Capas base
+        folium.TileLayer(
+            'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+            attr='OpenStreetMap', name='OpenStreetMap'
         ).add_to(mapa)
-        
-        # Añadir puntos críticos (círculos rojos)
-        for lon, lat in critical_coords:
-            folium.CircleMarker(
-                location=[lat, lon],
-                radius=6,
-                color='red',
-                weight=3,
-                fill=True,
-                fill_color='white',
-                fill_opacity=0.2,
-                popup=f"⚠️ Punto crítico<br>{indice}: valor bajo<br>Lat: {lat:.5f}<br>Lon: {lon:.5f}",
-                tooltip=f"Punto crítico {indice}"
+
+        if fondo == "Google Hybrid":
+            folium.TileLayer(
+                'https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
+                attr='Google Hybrid', name='Google Hybrid'
             ).add_to(mapa)
-        
-        # Añadir marcador central con etiqueta
-        center_lat = gdf.geometry.centroid.y.iloc[0]
-        center_lon = gdf.geometry.centroid.x.iloc[0]
-        html_label = f"""
-        <div style="background:white; border:2px solid #2ca02c; border-radius:6px; padding:3px 8px; font-size:11px; font-weight:bold; box-shadow:2px 2px 4px rgba(0,0,0,0.3); white-space:nowrap;">
-            {emoji} {cultivo}<br>
-            <span style="font-size:10px; color:#555;">{indice} {mean_val:.2f} ({riesgo})</span>
-        </div>
-        """
-        folium.Marker(
-            location=[center_lat, center_lon],
-            icon=folium.DivIcon(html=html_label, icon_size=(160, 35), icon_anchor=(80, 17))
-        ).add_to(mapa)
-        
-        # Añadir capa de GEE
+        else:
+            folium.TileLayer(
+                'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+                attr='Esri World Imagery', name='Esri Satellite'
+            ).add_to(mapa)
+
+        # Capa GEE
         tile_url = obtener_tile_url_gee(image, vis)
         if tile_url:
             folium.TileLayer(
                 tiles=tile_url,
-                attr='Google Earth Engine',
-                name=f"{indice} (GEE)",
+                attr='Google Earth Engine · Sentinel-2',
+                name=f'{indice} (Sentinel-2)',
                 overlay=True,
-                control=True
+                control=True,
+                opacity=0.88
             ).add_to(mapa)
-        
-        # Añadir selección de fondo de mapa
-        if basemap == 'google_hybrid':
-            folium.TileLayer(
-                tiles='https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}',
-                attr='Google',
-                name='Google Hybrid',
-                overlay=False,
-                control=True
+
+        # Polígono — estilo igual al HTML demo
+        popup_poly_html = (
+            f'<div style="font-family:Arial; min-width:210px;">'
+            f'<h4 style="margin:0; color:#2ca02c;">{riesgo_emoji} {ICONOS[cultivo]} {cultivo}</h4>'
+            f'<p style="margin:4px 0; font-size:11px; color:#888;">{area_ha:.2f} ha</p>'
+            f'<hr style="margin:6px 0;">'
+            f'<table style="font-size:13px; width:100%;">'
+            f'<tr><td>{indice}</td><td><b>{mean_val:.3f}{unidad}</b></td></tr>'
+            f'<tr><td>📐 Área</td><td><b>{area_ha:.2f} ha</b></td></tr>'
+            f'<tr><td>⚠️ Puntos críticos</td><td><b>{num_criticos}</b></td></tr>'
+            f'</table>'
+            f'<hr style="margin:6px 0;">'
+            f'<div style="text-align:center; padding:4px; background:#2ca02c; '
+            f'color:white; border-radius:4px; font-weight:bold;">Riesgo {riesgo}</div>'
+            f'</div>'
+        )
+        folium.GeoJson(
+            gdf.__geo_interface__,
+            name='Parcela',
+            style_function=lambda x: {
+                'color': '#2ca02c', 'weight': 3, 'dashArray': '6',
+                'fillColor': '#2ca02c', 'fillOpacity': 0.15
+            },
+            tooltip=f'{riesgo_emoji} {cultivo} — Riesgo {riesgo} ({indice}: {mean_val:.3f})',
+            popup=folium.Popup(popup_poly_html, max_width=250)
+        ).add_to(mapa)
+
+        # Puntos críticos — con enlace Google Maps (igual que HTML demo)
+        for lon_pt, lat_pt in critical_coords:
+            popup_pt = (
+                f'<div style="font-family:Arial;">'
+                f'<b>⚠️ Punto Crítico</b><br>'
+                f'{indice}: bajo umbral<br>'
+                f'Lat: {lat_pt:.5f}<br>Lon: {lon_pt:.5f}<br>'
+                f'<a href="https://www.google.com/maps/search/?api=1&query={lat_pt},{lon_pt}" '
+                f'target="_blank">📍 Ver en Google Maps</a>'
+                f'</div>'
+            )
+            folium.CircleMarker(
+                location=[lat_pt, lon_pt],
+                radius=6, color='red', weight=3,
+                fill=True, fill_color='white', fill_opacity=0.2,
+                popup=folium.Popup(popup_pt, max_width='100%'),
+                tooltip=f'Punto crítico: Lat {lat_pt:.4f}, Lon {lon_pt:.4f}'
             ).add_to(mapa)
-        else:
-            folium.TileLayer(
-                tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-                attr='Esri',
-                name='Esri Satellite',
-                overlay=False,
-                control=True
-            ).add_to(mapa)
-        
-        # Panel flotante (Dashboard de Decisión) - similar al ejemplo
-        panel_html = f"""
-        <div style="position: fixed; bottom: 30px; left: 30px; z-index: 1000;
-                    background: white; padding: 12px 16px; border-radius: 8px;
-                    border: 1px solid #ccc; box-shadow: 2px 2px 8px rgba(0,0,0,0.2);
-                    font-family: Arial; font-size: 12px; min-width: 200px;">
-            <b style="font-size:13px;">🌶️ Dashboard de Decisión</b>
-            <hr style="margin:6px 0;">
-            <b>{cultivo}:</b><br>
-            {emoji} Riesgo: <b>{riesgo}</b><br>
-            {indice} Medio: <b>{mean_val:.3f}</b>
-            <hr style="margin:6px 0;">
-            <b>Puntos Críticos:</b> {num_criticos}<br>
-            <span style="font-size:10px; color:#888;">Umbral {"<"+str(umbral_critico) if umbral_critico else "N/A"}</span>
-            <hr style="margin:6px 0;">
-            <b>Leyenda {indice}:</b><br>
-        """
-        # Añadir leyenda de colores según el índice
-        if indice in ["NDVI", "NDRE"]:
-            panel_html += """
-            <span style="color:#d73027;">■</span> Muy bajo (<0.2)<br>
-            <span style="color:#f1c40f;">■</span> Bajo (0.2-0.4)<br>
-            <span style="color:#2ecc71;">■</span> Óptimo (>0.4)
-            """
-        elif indice == "NDWI":
-            panel_html += """
-            <span style="color:#8B4513;">■</span> Seco (< -0.2)<br>
-            <span style="color:#white;">■</span> Normal (-0.2 a 0.2)<br>
-            <span style="color:#0000FF;">■</span> Húmedo (>0.2)
-            """
-        elif indice == "Temperatura":
-            panel_html += """
-            <span style="color:#313695;">■</span> Frío (<15°C)<br>
-            <span style="color:#ffffbf;">■</span> Óptimo (15-28°C)<br>
-            <span style="color:#d73027;">■</span> Calor (>28°C)
-            """
-        elif indice == "Precipitación":
-            panel_html += """
-            <span style="color:#f0f9e8;">■</span> Seco (<5 mm)<br>
-            <span style="color:#7bccc4;">■</span> Moderado (5-20 mm)<br>
-            <span style="color:#084081;">■</span> Lluvioso (>20 mm)
-            """
-        panel_html += '<hr style="margin:6px 0;"><span style="font-size:10px; color:#888;">Datos: Sentinel-2, ERA5, CHIRPS</span></div>'
-        
-        # Agregar el panel como un elemento HTML personalizado usando folium.Element
+
+        # Etiqueta central
+        center_lat_m = gdf.geometry.centroid.y.iloc[0]
+        center_lon_m = gdf.geometry.centroid.x.iloc[0]
+        label_html = (
+            f'<div style="background:white; border:2px solid #2ca02c; border-radius:6px;'
+            f'padding:3px 8px; font-size:11px; font-weight:bold;'
+            f'box-shadow:2px 2px 4px rgba(0,0,0,0.3); white-space:nowrap;">'
+            f'{riesgo_emoji} {ICONOS[cultivo]} {cultivo}<br>'
+            f'<span style="font-size:10px; color:#555;">'
+            f'{indice}: {mean_val:.3f} | Riesgo {riesgo}</span></div>'
+        )
+        folium.Marker(
+            location=[center_lat_m, center_lon_m],
+            icon=folium.DivIcon(html=label_html, icon_size=(210, 35), icon_anchor=(105, 17))
+        ).add_to(mapa)
+
+        # Panel flotante — mismo estilo HTML demo
+        riesgo_color = (
+            "#2ca02c" if riesgo == "BAJO" else
+            "#f39c12" if riesgo == "MEDIO" else
+            "#e74c3c"
+        )
+        leyenda_html = "".join(
+            f'<span style="color:{c};">■</span> {txt}&nbsp;&nbsp;'
+            for c, txt in leyenda
+        )
+        panel_html = (
+            f'<div style="position:fixed; bottom:40px; left:40px; z-index:1000;'
+            f'background:white; padding:12px 16px; border-radius:8px;'
+            f'border:1px solid #ccc; box-shadow:2px 2px 8px rgba(0,0,0,0.2);'
+            f'font-family:Arial; font-size:12px; min-width:190px;">'
+            f'<b style="font-size:13px;">{ICONOS[cultivo]} {cultivo}</b>'
+            f'<hr style="margin:6px 0;">'
+            f'<b>Riesgo:</b> <span style="color:{riesgo_color};">● {riesgo}</span><br>'
+            f'<b>{indice}:</b> {mean_val:.3f}{unidad}<br>'
+            + (f'<b>🌱 NDRE:</b> {ndre_val:.3f}<br>' if ndre_val is not None else '')
+            + f'<b>Área:</b> {area_ha:.2f} ha<br>'
+            f'<b>Puntos críticos:</b> {num_criticos}'
+            f'<hr style="margin:6px 0;">'
+            f'{leyenda_html}'
+            f'<hr style="margin:6px 0;">'
+            f'<span style="font-size:10px; color:#888;">Sentinel-2 · ERA5 · CHIRPS</span>'
+            f'</div>'
+        )
         from folium import Element
         Element(panel_html).add_to(mapa)
-        
-        # Control de capas
         folium.LayerControl(collapsed=False).add_to(mapa)
-        Fullscreen().add_to(mapa)
-        
-        # Mostrar mapa
-        folium_static(mapa, width=900, height=650)
-        st.success(f"✅ Mapa generado con {num_criticos} puntos críticos y panel informativo.")
+
+        # ── Renderizar con components.html (sin doble iframe de folium_static) ──
+        map_html = mapa.get_root().render()
+        components.html(map_html, height=650)
+        st.caption(
+            f"📊 **{indice}:** {mean_val:.3f}{unidad} · "
+            f"Riesgo: **{riesgo}** · "
+            f"{num_criticos} puntos críticos georeferenciados · "
+            f"Imagen: Sentinel-2 más reciente disponible"
+        )
 
 # ================= MONITOREO FENOLÓGICO =================
 with tab_monitoreo:
